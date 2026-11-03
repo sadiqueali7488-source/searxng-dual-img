@@ -7,7 +7,7 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 import httpx
 from models import SearchConfig, JobStatus, RowResult, ImageResult
-from searxng_client import search_searxng_image
+from searxng_client import search_searxng_image, sanitize_search_query
 
 PRODUCT_MASTER_30_COLUMNS = [
     'sku', 'variant_label', 'product_name', 'product_description',
@@ -239,6 +239,11 @@ class SearchJob:
             time_range = self.config.time_range if self.config else ""
             language = self.config.language if self.config else "auto"
 
+            orig = row.original_data or {}
+            brand_val = orig.get("brand_name") or orig.get("brand") or ""
+            prod_val = orig.get("product_name") or ""
+            var_val = orig.get("variant_label") or orig.get("variant") or ""
+
             # 1. Search Product Image (Without Size)
             if target in ["both", "product"]:
                 p_query = custom_query if (target == "product" and custom_query) else row.product_query
@@ -249,6 +254,10 @@ class SearchJob:
                     client=client,
                     base_url=base_url,
                     query=p_query,
+                    brand=brand_val,
+                    product_name=prod_val,
+                    variant_label=var_val,
+                    is_variant=False,
                     safesearch=safesearch,
                     time_range=time_range,
                     language=language
@@ -272,6 +281,10 @@ class SearchJob:
                     client=client,
                     base_url=base_url,
                     query=v_query,
+                    brand=brand_val,
+                    product_name=prod_val,
+                    variant_label=var_val,
+                    is_variant=True,
                     safesearch=safesearch,
                     time_range=time_range,
                     language=language
@@ -368,7 +381,7 @@ class JobManager:
                 p_parts.append(prod_name)
             if config.query_suffix:
                 p_parts.append(config.query_suffix.strip())
-            product_query = " ".join(p_parts).strip() or prod_name or brand or "product"
+            product_query = sanitize_search_query(" ".join(p_parts).strip() or prod_name or brand or "product")
 
             # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label
             v_parts = []
@@ -382,7 +395,7 @@ class JobManager:
                 v_parts.append(variant)
             if config.query_suffix:
                 v_parts.append(config.query_suffix.strip())
-            variant_query = " ".join(v_parts).strip() or product_query
+            variant_query = sanitize_search_query(" ".join(v_parts).strip() or product_query)
 
             job.row_results.append(RowResult(
                 row_index=idx,
@@ -430,11 +443,20 @@ class JobManager:
                     if config.delay_ms > 0:
                         await asyncio.sleep(config.delay_ms / 1000.0)
 
+                    orig_row = row_res.original_data or {}
+                    b_val = orig_row.get("brand_name") or orig_row.get("brand") or ""
+                    p_val = orig_row.get("product_name") or ""
+                    v_val = orig_row.get("variant_label") or orig_row.get("variant") or ""
+
                     # 1. Search Product Image (Without Size)
                     res_p = await search_searxng_image(
                         client=client,
                         base_url=config.searxng_url,
                         query=row_res.product_query,
+                        brand=b_val,
+                        product_name=p_val,
+                        variant_label=v_val,
+                        is_variant=False,
                         safesearch=config.safesearch,
                         time_range=config.time_range,
                         language=config.language
@@ -463,6 +485,10 @@ class JobManager:
                             client=client,
                             base_url=config.searxng_url,
                             query=row_res.variant_query,
+                            brand=b_val,
+                            product_name=p_val,
+                            variant_label=v_val,
+                            is_variant=True,
                             safesearch=config.safesearch,
                             time_range=config.time_range,
                             language=config.language

@@ -13,7 +13,7 @@ EXPECTED_COLUMNS = [
   'variant_images'
 ]
 
-js_prepare_queries = """
+js_prepare_queries = r"""
 const EXPECTED_COLUMNS = [
   'sku', 'variant_label', 'product_name', 'product_description',
   'product_prescription_required', 'brand_name', 'brand_description',
@@ -57,9 +57,13 @@ function cleanAxes(axes) {
 
 function cleanAttr(attr) {
   if (!attr) return '';
-  let s = String(attr).replace(/\\r?\\n|\\r/g, ' ').trim();
+  let s = String(attr).replace(/\r?\n|\r/g, ' ').trim();
   const parts = s.split(/[;|]/).map(p => p.trim()).filter(Boolean);
   return parts.join('|');
+}
+
+function sanitizeQuery(text) {
+  return String(text || '').replace(/[%#*+=\\\[\]{}()<>"~`]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 return rows.map((item, index) => {
@@ -89,18 +93,18 @@ return rows.map((item, index) => {
     pParts.push(brand);
   }
   if (prodName) pParts.push(prodName);
-  const productQuery = pParts.join(' ').replace(/\\s+/g, ' ').trim() || prodName || 'product';
+  const productQuery = sanitizeQuery(pParts.join(' ')) || prodName || 'product';
 
   // 2. Variant Image Query (WITH SIZE) -> Brand + Product Name + Variant Label
   const vParts = [];
   if (brand && !prodName.toLowerCase().includes(brand.toLowerCase())) {
     vParts.push(brand);
   }
-  if (prodName) vParts.push(prodName);
+  if (prodName) pParts.push(prodName);
   if (variant && !prodName.toLowerCase().includes(variant.toLowerCase())) {
     vParts.push(variant);
   }
-  const variantQuery = vParts.join(' ').replace(/\\s+/g, ' ').trim() || productQuery;
+  const variantQuery = sanitizeQuery(vParts.join(' ')) || productQuery;
 
   return {
     json: {
@@ -114,33 +118,85 @@ return rows.map((item, index) => {
 });
 """
 
-js_pick_product_image = """
+js_pick_product_image = r"""
 const original = $('Prepare Dual Search Queries').item.json;
 let payload = $json.body ?? $json;
 
 if (typeof payload === 'string') {
-  try {
-    payload = JSON.parse(payload);
-  } catch (error) {}
+  try { payload = JSON.parse(payload); } catch (e) {}
 }
-
 if (payload && payload.data && Array.isArray(payload.data.results)) {
   payload = payload.data;
 }
 
-const results = Array.isArray(payload?.results) ? payload.results : [];
+const rawResults = Array.isArray(payload?.results) ? payload.results : [];
 
-// Pick 2nd image (index 1) if available, otherwise fallback to 1st image (index 0)
-let selectedImg = null;
-if (results.length > 1) {
-  selectedImg = results[1];
-} else if (results.length === 1) {
-  selectedImg = results[0];
+// INTELLIGENT RELEVANCE SCORING: Eliminate competitor brands and pick true product packshot
+function scoreImages(results, brand, prodName) {
+  const brandTokens = (brand || '').toLowerCase().split(/[\s\-_]+/).filter(t => t.length >= 2);
+  const stopWords = new Set(['100', 'pure', 'pack', 'pouch', 'packet', 'the', 'and', 'for', 'with', 'original', 'best', 'organic']);
+  const prodTokens = (prodName || '').toLowerCase().split(/[\s\-_]+/).filter(t => t.length >= 3 && !stopWords.has(t));
+
+  let hasBrandMatch = false;
+  const scored = [];
+
+  for (const item of results) {
+    const title = (item.title || '').toLowerCase();
+    const imgSrc = (item.img_src || item.thumbnail_src || item.url || '').toLowerCase();
+    const combined = `${title} ${imgSrc}`;
+
+    let score = 0;
+    let bMatches = 0;
+
+    if (brandTokens.length > 0) {
+      for (const bt of brandTokens) {
+        if (combined.includes(bt)) bMatches++;
+      }
+      if (bMatches === brandTokens.length) {
+        score += 100;
+        hasBrandMatch = true;
+      } else if (bMatches > 0) {
+        score += 50;
+        hasBrandMatch = true;
+      } else {
+        score -= 80; // Strictly penalize wrong brands!
+      }
+    }
+
+    for (const pt of prodTokens) {
+      if (brandTokens.includes(pt)) continue;
+      if (combined.includes(pt)) {
+        if (['sattu', 'besan', 'atta', 'maida', 'sooji', 'flour', 'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee'].includes(pt)) {
+          score += 45;
+        } else {
+          score += 15;
+        }
+      }
+    }
+
+    const trusted = ['amazon', 'flipkart', 'bigbasket', 'blinkit', 'zepto', 'jiomart', 'dailymart4u', 'f.nooncdn', 'exportersindia'];
+    if (trusted.some(t => combined.includes(t))) score += 20;
+
+    const spam = ['pinterest', 'wallpaper', 'facebook', 'instagram', 'clipart', 'vector'];
+    if (spam.some(s => combined.includes(s))) score -= 60;
+
+    scored.push({ item, score, bMatches });
+  }
+
+  let filtered = scored;
+  if (hasBrandMatch && brandTokens.length > 0) {
+    filtered = scored.filter(x => x.bMatches > 0 || x.score > 0);
+  }
+  filtered.sort((a, b) => b.score - a.score);
+  return filtered.map(x => x.item);
 }
 
+const ranked = scoreImages(rawResults, original.brand_name, original.product_name);
+const bestItem = (ranked.length > 0) ? ranked[0] : (rawResults[0] ?? null);
+
 let imageUrl = '';
-if (selectedImg) {
-  imageUrl = selectedImg.img_src || selectedImg.thumbnail_src || selectedImg.url || '';
+if (bestItem) {
+  imageUrl = bestItem.img_src || bestItem.thumbnail_src || bestItem.url || '';
   if (imageUrl.startsWith('//')) {
     imageUrl = 'https:' + imageUrl;
   }
@@ -158,33 +214,97 @@ return {
 };
 """
 
-js_pick_variant_image = """
+js_pick_variant_image = r"""
 const original = $('Pick Product Image (2nd Result)').item.json;
 let payload = $json.body ?? $json;
 
 if (typeof payload === 'string') {
-  try {
-    payload = JSON.parse(payload);
-  } catch (error) {}
+  try { payload = JSON.parse(payload); } catch (e) {}
 }
-
 if (payload && payload.data && Array.isArray(payload.data.results)) {
   payload = payload.data;
 }
 
-const results = Array.isArray(payload?.results) ? payload.results : [];
+const rawResults = Array.isArray(payload?.results) ? payload.results : [];
 
-// Pick 2nd image (index 1) if available, otherwise fallback to 1st image (index 0)
-let selectedImg = null;
-if (results.length > 1) {
-  selectedImg = results[1];
-} else if (results.length === 1) {
-  selectedImg = results[0];
+// INTELLIGENT RELEVANCE SCORING: Eliminate competitor brands and match exact variant size
+function scoreImages(results, brand, prodName, variantLabel) {
+  const brandTokens = (brand || '').toLowerCase().split(/[\s\-_]+/).filter(t => t.length >= 2);
+  const stopWords = new Set(['100', 'pure', 'pack', 'pouch', 'packet', 'the', 'and', 'for', 'with', 'original', 'best', 'organic']);
+  const prodTokens = (prodName || '').toLowerCase().split(/[\s\-_]+/).filter(t => t.length >= 3 && !stopWords.has(t));
+
+  let hasBrandMatch = false;
+  const scored = [];
+
+  for (const item of results) {
+    const title = (item.title || '').toLowerCase();
+    const imgSrc = (item.img_src || item.thumbnail_src || item.url || '').toLowerCase();
+    const combined = `${title} ${imgSrc}`;
+
+    let score = 0;
+    let bMatches = 0;
+
+    if (brandTokens.length > 0) {
+      for (const bt of brandTokens) {
+        if (combined.includes(bt)) bMatches++;
+      }
+      if (bMatches === brandTokens.length) {
+        score += 100;
+        hasBrandMatch = true;
+      } else if (bMatches > 0) {
+        score += 50;
+        hasBrandMatch = true;
+      } else {
+        score -= 80; // Strictly penalize wrong brands!
+      }
+    }
+
+    for (const pt of prodTokens) {
+      if (brandTokens.includes(pt)) continue;
+      if (combined.includes(pt)) {
+        if (['sattu', 'besan', 'atta', 'maida', 'sooji', 'flour', 'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee'].includes(pt)) {
+          score += 45;
+        } else {
+          score += 15;
+        }
+      }
+    }
+
+    // Exact size matching bonus for variant
+    if (variantLabel) {
+      const vMatch = variantLabel.toLowerCase().match(/(\d+)\s*(kg|g|gm|ml|l|ltr)?/);
+      if (vMatch) {
+        const num = vMatch[1];
+        const unit = vMatch[2] || '';
+        if (combined.includes(`${num}${unit}`) || combined.includes(`${num} ${unit}`) || combined.includes(`${num}gm`) || combined.includes(`${num}kg`)) {
+          score += 50;
+        }
+      }
+    }
+
+    const trusted = ['amazon', 'flipkart', 'bigbasket', 'blinkit', 'zepto', 'jiomart', 'dailymart4u', 'f.nooncdn', 'exportersindia'];
+    if (trusted.some(t => combined.includes(t))) score += 20;
+
+    const spam = ['pinterest', 'wallpaper', 'facebook', 'instagram', 'clipart', 'vector'];
+    if (spam.some(s => combined.includes(s))) score -= 60;
+
+    scored.push({ item, score, bMatches });
+  }
+
+  let filtered = scored;
+  if (hasBrandMatch && brandTokens.length > 0) {
+    filtered = scored.filter(x => x.bMatches > 0 || x.score > 0);
+  }
+  filtered.sort((a, b) => b.score - a.score);
+  return filtered.map(x => x.item);
 }
 
+const ranked = scoreImages(rawResults, original.brand_name, original.product_name, original.variant_label);
+const bestItem = (ranked.length > 0) ? ranked[0] : (rawResults[0] ?? null);
+
 let imageUrl = '';
-if (selectedImg) {
-  imageUrl = selectedImg.img_src || selectedImg.thumbnail_src || selectedImg.url || '';
+if (bestItem) {
+  imageUrl = bestItem.img_src || bestItem.thumbnail_src || bestItem.url || '';
   if (imageUrl.startsWith('//')) {
     imageUrl = 'https:' + imageUrl;
   }
@@ -402,9 +522,8 @@ full_wf = {
 with open("c:/Users/Administrator/Desktop/image search/n8n_dual_search_workflow.json", "w", encoding="utf-8") as f:
     json.dump(full_wf, f, indent=2)
 
-print("n8n_dual_search_workflow.json written successfully!")
+print("n8n_dual_search_workflow.json updated successfully!")
 
-# Now update n8n SQLite DB for both workflow IDs: jPHVv0xMEkwPLSQb and Q3NNpfzfLfBc4Nxr
 nodes_json = json.dumps(nodes)
 connections_json = json.dumps(connections)
 name = "SearXNG - Dual Product & Variant Image Finder (Without & With Size 30-Cols)"
@@ -418,12 +537,10 @@ const nodes = {json.dumps(nodes_json)};
 const connections = {json.dumps(connections_json)};
 
 const wfIds = ["jPHVv0xMEkwPLSQb", "Q3NNpfzfLfBc4Nxr"];
-let count = 0;
 for (const id of wfIds) {{
   db.run("UPDATE workflow_entity SET name = ?, nodes = ?, connections = ? WHERE id = ?", [name, nodes, connections, id], function(err) {{
     if (err) console.error("Error updating " + id + ":", err);
     else console.log("Updated workflow " + id + ", changes: " + this.changes);
-    count++;
   }});
 }}
 """
