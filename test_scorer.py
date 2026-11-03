@@ -92,3 +92,4 @@ for i, (score, r) in enumerate(scored[:5]):
     print(f"#{i+1} [Score: {score:.1f}] Title: {r.get('title')}")
     print(f"    Engine: {r.get('engine')}")
     print(f"    URL: {r.get('img_src') or r.get('thumbnail_src')}")
+

@@ -160,3 +160,4 @@ for tc in test_cases:
         print(f"               URL:   {top_v.get('img_src') or top_v.get('thumbnail_src')}")
     else:
         print("   NO RESULT FOUND!")
+

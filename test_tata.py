@@ -74,3 +74,4 @@ with httpx.Client(base_url="http://localhost:8000", timeout=20.0) as client:
     print("Variant Query:       ", row.get("variant_query"))
     print("Variant Image URL:   ", row.get("variant_image_url"))
     print("Variant Engine:      ", row.get("variant_engine"))
+
