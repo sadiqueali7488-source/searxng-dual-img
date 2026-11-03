@@ -1,0 +1,297 @@
+{
+  "name": "SearXNG - Dual Product & Variant Image Finder (Without & With Size 30-Cols)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "b840f3a8-cd66-4159-8558-d04510ab3514",
+        "formTitle": "SearXNG Product Master Image Finder (Dual Images: Without & With Size)",
+        "formDescription": "Upload Product Master Excel (.xlsx) or CSV. Dual search will find Product Image (without size) and Variant Image (with size) from SearXNG picking the 2nd best image with 100% clean formatting and all 30 columns preserved.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Product Master File (.xlsx, .xls, .csv)",
+              "fieldType": "file",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "e83286b2-f38b-4bfe-9875-9e4726bbd79b",
+      "name": "Upload Excel",
+      "webhookId": "b840f3a8-cd66-4159-8558-d04510ab3514"
+    },
+    {
+      "parameters": {
+        "operation": "fromFile",
+        "binaryPropertyName": "data",
+        "options": {
+          "readAsString": true
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        220,
+        0
+      ],
+      "id": "cbdd6216-9b16-43ad-8d9e-1d5be7ea529b",
+      "name": "Read Excel Rows"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst EXPECTED_COLUMNS = [\n  'sku', 'variant_label', 'product_name', 'product_description',\n  'product_prescription_required', 'brand_name', 'brand_description',\n  'brand_image', 'parent_category_name', 'parent_category_description',\n  'parent_category_icon', 'parent_category_prescription_required',\n  'parent_category_is_featured', 'category_name', 'category_description',\n  'category_icon', 'category_prescription_required', 'category_is_featured',\n  'mrp', 'sale_price', 'tax_inclusive', 'barcode', 'gtin', 'mpn', 'color_hex',\n  'product_attributes', 'variant_attributes', 'variant_axes', 'product_images',\n  'variant_images'\n];\n\nconst rows = $input.all();\nif (rows.length === 0) {\n  throw new Error('The uploaded file has no data rows. Add at least one product row and upload again.');\n}\n\nfunction cleanBrand(brand, prodName) {\n  let b = String(brand || '').trim();\n  if (/^0?9:00(:00)?\\s*(AM|PM)?$/i.test(b) || b.includes('9:00') || /^9\\s*AM$/i.test(b)) return '9AM';\n  if (prodName && /^9\\s*AM\b/i.test(prodName)) return '9AM';\n  return b;\n}\n\nfunction cleanCurrency(val) {\n  if (!val) return '';\n  const s = String(val).replace(/,/g, '').trim();\n  const match = s.match(/([0-9]+(?:\\.[0-9]+)?)/);\n  if (match) {\n    return '\u20b9' + parseFloat(match[1]).toFixed(2);\n  }\n  return s;\n}\n\nfunction cleanAxes(axes) {\n  if (!axes) return '';\n  let s = String(axes).trim().replace(/^[\\[\\(\\{\"']+|[\\]\\)\\}\"']+$/g, '').replace(/[\"']/g, '');\n  const parts = s.split(/[,;|]/).map(p => p.trim()).filter(Boolean);\n  return parts.join(' | ');\n}\n\nfunction cleanAttr(attr) {\n  if (!attr) return '';\n  let s = String(attr).replace(/\\r?\\n|\\r/g, ' ').trim();\n  const parts = s.split(/[;|]/).map(p => p.trim()).filter(Boolean);\n  return parts.join('|');\n}\n\nreturn rows.map((item, index) => {\n  const row = item.json ?? {};\n  const normalized = {};\n\n  for (const col of EXPECTED_COLUMNS) {\n    normalized[col] = (row[col] !== undefined && row[col] !== null) ? String(row[col]) : '';\n  }\n\n  const prodName = normalized.product_name.trim();\n  normalized.brand_name = cleanBrand(normalized.brand_name, prodName);\n  normalized.mrp = cleanCurrency(normalized.mrp);\n  normalized.sale_price = cleanCurrency(normalized.sale_price);\n  normalized.variant_axes = cleanAxes(normalized.variant_axes);\n  normalized.product_attributes = cleanAttr(normalized.product_attributes);\n  normalized.variant_attributes = cleanAttr(normalized.variant_attributes);\n  normalized.product_images = '';\n  normalized.variant_images = '';\n\n  const brand = normalized.brand_name.trim();\n  const variant = normalized.variant_label.trim();\n\n  // 1. Product Image Query (WITHOUT SIZE) -> Brand + Product Name\n  const pParts = [];\n  if (brand && !prodName.toLowerCase().includes(brand.toLowerCase())) {\n    pParts.push(brand);\n  }\n  if (prodName) pParts.push(prodName);\n  const productQuery = pParts.join(' ').replace(/\\s+/g, ' ').trim() || prodName || 'product';\n\n  // 2. Variant Image Query (WITH SIZE) -> Brand + Product Name + Variant Label\n  const vParts = [];\n  if (brand && !prodName.toLowerCase().includes(brand.toLowerCase())) {\n    vParts.push(brand);\n  }\n  if (prodName) vParts.push(prodName);\n  if (variant && !prodName.toLowerCase().includes(variant.toLowerCase())) {\n    vParts.push(variant);\n  }\n  const variantQuery = vParts.join(' ').replace(/\\s+/g, ' ').trim() || productQuery;\n\n  return {\n    json: {\n      ...normalized,\n      product_query: productQuery,\n      variant_query: variantQuery,\n      row_index: index\n    },\n    pairedItem: { item: index }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "id": "18cfc7a7-3ce9-408a-a63e-b49eb72df3b6",
+      "name": "Prepare Dual Search Queries"
+    },
+    {
+      "parameters": {
+        "url": "http://host.docker.internal:8888/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.product_query }}"
+            },
+            {
+              "name": "category_images",
+              "value": "1"
+            },
+            {
+              "name": "engines",
+              "value": "google images,bing images,duckduckgo images"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 100
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        0
+      ],
+      "id": "f5df84b0-a359-4d69-be54-c64ef5f9927f",
+      "name": "Search Product Images (No Size)"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst original = $('Prepare Dual Search Queries').item.json;\nlet payload = $json.body ?? $json;\n\nif (typeof payload === 'string') {\n  try {\n    payload = JSON.parse(payload);\n  } catch (error) {}\n}\n\nif (payload && payload.data && Array.isArray(payload.data.results)) {\n  payload = payload.data;\n}\n\nconst results = Array.isArray(payload?.results) ? payload.results : [];\n\n// Pick 2nd image (index 1) if available, otherwise fallback to 1st image (index 0)\nlet selectedImg = null;\nif (results.length > 1) {\n  selectedImg = results[1];\n} else if (results.length === 1) {\n  selectedImg = results[0];\n}\n\nlet imageUrl = '';\nif (selectedImg) {\n  imageUrl = selectedImg.img_src || selectedImg.thumbnail_src || selectedImg.url || '';\n  if (imageUrl.startsWith('//')) {\n    imageUrl = 'https:' + imageUrl;\n  }\n}\n\n// Pure direct URL link without array brackets or quotes\nimageUrl = imageUrl.trim().replace(/^[\\[\"']+|[\\]\"']+$/g, '');\n\nconst updatedRow = { ...original };\nupdatedRow.product_images = imageUrl;\n\nreturn {\n  json: updatedRow,\n  pairedItem: $input.item.pairedItem\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        0
+      ],
+      "id": "c1f7ab29-4ae5-48fa-8692-749e75df4211",
+      "name": "Pick Product Image (2nd Result)"
+    },
+    {
+      "parameters": {
+        "url": "http://host.docker.internal:8888/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.variant_query }}"
+            },
+            {
+              "name": "category_images",
+              "value": "1"
+            },
+            {
+              "name": "engines",
+              "value": "google images,bing images,duckduckgo images"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 100
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1160,
+        0
+      ],
+      "id": "e4299b82-938a-4933-9ce6-c67ef84a1d29",
+      "name": "Search Variant Images (With Size)"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst original = $('Pick Product Image (2nd Result)').item.json;\nlet payload = $json.body ?? $json;\n\nif (typeof payload === 'string') {\n  try {\n    payload = JSON.parse(payload);\n  } catch (error) {}\n}\n\nif (payload && payload.data && Array.isArray(payload.data.results)) {\n  payload = payload.data;\n}\n\nconst results = Array.isArray(payload?.results) ? payload.results : [];\n\n// Pick 2nd image (index 1) if available, otherwise fallback to 1st image (index 0)\nlet selectedImg = null;\nif (results.length > 1) {\n  selectedImg = results[1];\n} else if (results.length === 1) {\n  selectedImg = results[0];\n}\n\nlet imageUrl = '';\nif (selectedImg) {\n  imageUrl = selectedImg.img_src || selectedImg.thumbnail_src || selectedImg.url || '';\n  if (imageUrl.startsWith('//')) {\n    imageUrl = 'https:' + imageUrl;\n  }\n}\n\n// Pure direct URL link without array brackets or quotes\nimageUrl = imageUrl.trim().replace(/^[\\[\"']+|[\\]\"']+$/g, '');\n\nconst finalRow = { ...original };\nfinalRow.variant_images = imageUrl;\n\n// Fallback if one image is missing\nif (!finalRow.product_images && finalRow.variant_images) {\n  finalRow.product_images = finalRow.variant_images;\n}\nif (!finalRow.variant_images && finalRow.product_images) {\n  finalRow.variant_images = finalRow.product_images;\n}\n\ndelete finalRow.product_query;\ndelete finalRow.variant_query;\ndelete finalRow.row_index;\n\nreturn {\n  json: finalRow,\n  pairedItem: $input.item.pairedItem\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        0
+      ],
+      "id": "84477218-c2b6-455b-819e-f002bf023ab8",
+      "name": "Pick Variant Image (2nd Result)"
+    },
+    {
+      "parameters": {
+        "operation": "toFile",
+        "fileFormat": "csv",
+        "options": {
+          "fileName": "Product_Master_With_SearXNG_Dual_Images.csv"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        1640,
+        0
+      ],
+      "id": "a1f9dcae-0fb5-4a6c-9c98-43d78c33ec75",
+      "name": "Create Result CSV"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "binary",
+        "dataPropertyName": "data"
+      },
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.2,
+      "position": [
+        1880,
+        0
+      ],
+      "id": "b304dfa2-c7f8-48b7-846f-c1f0b09968a3",
+      "name": "Download Result File"
+    }
+  ],
+  "connections": {
+    "Upload Excel": {
+      "main": [
+        [
+          {
+            "node": "Read Excel Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Excel Rows": {
+      "main": [
+        [
+          {
+            "node": "Prepare Dual Search Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Dual Search Queries": {
+      "main": [
+        [
+          {
+            "node": "Search Product Images (No Size)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Product Images (No Size)": {
+      "main": [
+        [
+          {
+            "node": "Pick Product Image (2nd Result)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Product Image (2nd Result)": {
+      "main": [
+        [
+          {
+            "node": "Search Variant Images (With Size)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Variant Images (With Size)": {
+      "main": [
+        [
+          {
+            "node": "Pick Variant Image (2nd Result)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Variant Image (2nd Result)": {
+      "main": [
+        [
+          {
+            "node": "Create Result CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Result CSV": {
+      "main": [
+        [
+          {
+            "node": "Download Result File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null
+}

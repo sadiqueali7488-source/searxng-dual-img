@@ -1,0 +1,165 @@
+{
+  "name": "SearXNG - Product Master 30-Column Image Finder (Fixed Clean Format)",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "1",
+      "name": "When clicking ‘Test workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "fromFile",
+        "fileFormat": "autodetect",
+        "options": {}
+      },
+      "id": "2",
+      "name": "Read Excel or CSV",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const EXPECTED_COLUMNS = [\n  'sku', 'variant_label', 'product_name', 'product_description',\n  'product_prescription_required', 'brand_name', 'brand_description',\n  'brand_image', 'parent_category_name', 'parent_category_description',\n  'parent_category_icon', 'parent_category_prescription_required',\n  'parent_category_is_featured', 'category_name', 'category_description',\n  'category_icon', 'category_prescription_required', 'category_is_featured',\n  'mrp', 'sale_price', 'tax_inclusive', 'barcode', 'gtin', 'mpn', 'color_hex',\n  'product_attributes', 'variant_attributes', 'variant_axes', 'product_images',\n  'variant_images'\n];\n\nconst items = $input.all();\nif (!items.length) {\n  throw new Error('CSV/Excel contains no rows.');\n}\n\nfunction cleanBrand(brand, prodName) {\n  let b = String(brand || '').trim();\n  if (/^0?9:00(:00)?\\s*(AM|PM)?$/i.test(b) || b.includes('9:00')) return '9AM';\n  if (prodName && /^9\\s*AM\\b/i.test(prodName)) return '9AM';\n  return b;\n}\n\nfunction cleanCurrency(val) {\n  if (!val) return '';\n  const s = String(val).replace(/,/g, '').trim();\n  const match = s.match(/([0-9]+(?:\\.[0-9]+)?)/);\n  if (match) {\n    return '₹' + parseFloat(match[1]).toFixed(2);\n  }\n  return s;\n}\n\nfunction cleanAxes(axes) {\n  if (!axes) return '';\n  let s = String(axes).trim().replace(/^[\\[\\(\\{\"']+|[\\]\\)\\}\"']+$/g, '').replace(/[\"']/g, '');\n  const parts = s.split(/[,;|]/).map(p => p.trim()).filter(Boolean);\n  return parts.join(' | ');\n}\n\nfunction cleanAttr(attr) {\n  if (!attr) return '';\n  let s = String(attr).replace(/\\r?\\n|\\r/g, ' ').trim();\n  const parts = s.split(/[;|]/).map(p => p.trim()).filter(Boolean);\n  return parts.join('|');\n}\n\nconst output = [];\n\nfor (const item of items) {\n  const row = item.json;\n  const normalized = {};\n\n  for (const col of EXPECTED_COLUMNS) {\n    normalized[col] = (row[col] !== undefined && row[col] !== null) ? String(row[col]) : '';\n  }\n\n  const name = normalized.product_name.trim();\n  normalized.brand_name = cleanBrand(normalized.brand_name, name);\n  normalized.mrp = cleanCurrency(normalized.mrp);\n  normalized.sale_price = cleanCurrency(normalized.sale_price);\n  normalized.variant_axes = cleanAxes(normalized.variant_axes);\n  normalized.product_attributes = cleanAttr(normalized.product_attributes);\n  normalized.variant_attributes = cleanAttr(normalized.variant_attributes);\n  normalized.product_images = '';\n  normalized.variant_images = '';\n\n  const brand = normalized.brand_name.trim();\n  const variant = normalized.variant_label.trim();\n\n  const queryParts = [];\n  if (brand && !name.toLowerCase().includes(brand.toLowerCase())) {\n    queryParts.push(brand);\n  }\n  if (name) queryParts.push(name);\n  if (variant && !name.toLowerCase().includes(variant.toLowerCase())) {\n    queryParts.push(variant);\n  }\n\n  output.push({\n    json: {\n      ...normalized,\n      _search_query: queryParts.join(' ').trim() || name || 'product'\n    }\n  });\n}\n\nreturn output;"
+      },
+      "id": "3",
+      "name": "Prepare Brand Product Variant Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "url": "=http://host.docker.internal:8888/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json._search_query }}"
+            },
+            {
+              "name": "category_images",
+              "value": "1"
+            },
+            {
+              "name": "pageno",
+              "value": "1"
+            },
+            {
+              "name": "language",
+              "value": "auto"
+            },
+            {
+              "name": "safesearch",
+              "value": "0"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "4",
+      "name": "Search Images in SearXNG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst output = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const parentData = $('Prepare Brand Product Variant Query').item(i).json;\n  const searxngResponse = items[i].json;\n  const results = searxngResponse.results || [];\n\n  let imageUrl = '';\n  if (results.length > 0) {\n    const top = results[0];\n    imageUrl = top.img_src || top.thumbnail_src || top.url || '';\n    if (imageUrl.startsWith('//')) {\n      imageUrl = 'https:' + imageUrl;\n    }\n  }\n\n  // Direct clean URL string without array brackets\n  imageUrl = imageUrl.trim().replace(/^[\\[\"']+|[\\]\"']+$/g, '');\n\n  const finalRow = { ...parentData };\n  delete finalRow._search_query;\n\n  finalRow.product_images = imageUrl;\n  finalRow.variant_images = imageUrl;\n\n  output.push({ json: finalRow });\n}\n\nreturn output;"
+      },
+      "id": "5",
+      "name": "Pick First Image URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 300]
+    },
+    {
+      "parameters": {
+        "operation": "toFile",
+        "fileFormat": "csv",
+        "options": {
+          "fileName": "Product_Master_With_Images.csv"
+        }
+      },
+      "id": "6",
+      "name": "Create Result CSV",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 2,
+      "position": [1380, 300]
+    }
+  ],
+  "connections": {
+    "When clicking ‘Test workflow’": {
+      "main": [
+        [
+          {
+            "node": "Read Excel or CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Excel or CSV": {
+      "main": [
+        [
+          {
+            "node": "Prepare Brand Product Variant Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Brand Product Variant Query": {
+      "main": [
+        [
+          {
+            "node": "Search Images in SearXNG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Images in SearXNG": {
+      "main": [
+        [
+          {
+            "node": "Pick First Image URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick First Image URL": {
+      "main": [
+        [
+          {
+            "node": "Create Result CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

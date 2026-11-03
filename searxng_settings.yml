@@ -1,0 +1,56 @@
+use_default_settings: true
+
+server:
+  secret_key: "jJZRGYyMpRZpwZQ8NAUvevNbcD5iXGo"
+  image_proxy: true
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 12.0
+  useragent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google images
+    engine: google_images
+    shortcut: goi
+    disabled: false
+    timeout: 8.0
+
+  - name: bing images
+    engine: bing_images
+    shortcut: bii
+    disabled: false
+    timeout: 8.0
+
+  - name: duckduckgo images
+    engine: duckduckgo_extra
+    shortcut: ddi
+    categories: [images]
+    ddg_category: images
+    disabled: false
+    timeout: 8.0
+
+  # Disable all noisy / non-product image engines
+  - name: wikicommons.images
+    disabled: true
+  - name: pinterest
+    disabled: true
+  - name: flickr
+    disabled: true
+  - name: openverse
+    disabled: true
+  - name: unsplash
+    disabled: true
+  - name: deviantart
+    disabled: true
+  - name: 1x
+    disabled: true
+  - name: artic
+    disabled: true
+  - name: archive.org
+    disabled: true

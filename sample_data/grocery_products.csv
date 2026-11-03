@@ -1,0 +1,12 @@
+product_id,product_name,brand,category,barcode,price
+101,Pizza Hut Pepperoni Feast Pan Pizza,Pizza Hut,Fast Food,890123456701,14.99
+102,Domino's Farmhouse Loaded Cheesy Pizza,Domino's,Fast Food,890123456702,12.50
+103,Maggi 2-Minute Masala Instant Noodles 280g,Nestle,Grocery,890123456703,1.99
+104,Coca-Cola Original Taste Can 330ml,Coca-Cola,Beverages,890123456704,0.99
+105,Amul Pure Salted Butter 500g,Amul,Dairy,890123456705,3.50
+106,Nutella Hazelnut Spread with Cocoa 750g,Ferrero,Grocery,890123456706,6.99
+107,Doritos Nacho Cheese Tortilla Chips 150g,Frito-Lay,Snacks,890123456707,2.49
+108,Lays Classic Salted Potato Chips 50g,Lays,Snacks,890123456708,1.20
+109,Nescafe Classic Instant Coffee Jar 100g,Nescafe,Beverages,890123456709,4.80
+110,Cadbury Dairy Milk Silk Chocolate 150g,Cadbury,Confectionery,890123456710,2.99
+

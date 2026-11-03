@@ -1,0 +1,265 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Product Image URL Finder",
+        "formDescription": "Upload an .xlsx workbook. The first worksheet must contain the columns variant_label and product_name. The workflow searches SearXNG Images and returns an Excel file with the first direct image URL for each product.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Upload Excel (.xlsx)",
+              "fieldType": "file",
+              "fieldName": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".xlsx,.csv",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "appendAttribution": false,
+          "ignoreBots": true
+        }
+      },
+      "id": "b218a1cb-1a3c-47eb-b70a-1391522c495b",
+      "name": "Upload Excel",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.5,
+      "position": [
+        -1744,
+        0
+      ],
+      "webhookId": "b840f3a8-cd66-4159-8558-d04510ab3514"
+    },
+    {
+      "parameters": {
+        "binaryPropertyName": "file",
+        "options": {}
+      },
+      "id": "bb0013a6-31c5-4bd3-9174-4dc8e2ea82fb",
+      "name": "Read Excel Rows",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -1520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all();\nif (rows.length === 0) {\n  throw new Error('The uploaded Excel file has no data rows. Add at least one product row below the header.');\n}\n\nconst normalizeHeader = (value) => String(value ?? '')\n  .replace(/^\\uFEFF/, '')\n  .trim()\n  .toLowerCase()\n  .replace(/[\\s-]+/g, '_');\n\nconst firstRow = rows[0].json ?? {};\nconst headers = Object.keys(firstRow);\nconst variantKey = headers.find((key) => normalizeHeader(key) === 'variant_label');\nconst productKey = headers.find((key) => normalizeHeader(key) === 'product_name');\n\nif (!variantKey || !productKey) {\n  throw new Error(\n    'Missing required Excel headers. The first worksheet must contain exactly these columns: variant_label and product_name. Found: ' + headers.join(', ')\n  );\n}\n\nreturn rows.map((item, index) => {\n  const row = item.json ?? {};\n  const variantValue = row[variantKey] ?? '';\n  const productValue = row[productKey] ?? '';\n  const variantLabel = String(variantValue).trim();\n  const productName = String(productValue).trim();\n\n  if (!productName) {\n    throw new Error('product_name is blank at Excel data row ' + (index + 2) + '. Fill every product_name cell and upload again.');\n  }\n\n  const searchQuery = [productName, variantLabel].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();\n  return {\n    json: {\n      variant_label: variantLabel,\n      product_name: productName,\n      search_query: searchQuery,\n      input_row: index + 2,\n    },\n    pairedItem: { item: index },\n  };\n});"
+      },
+      "id": "8996eb1c-eede-43bf-a29e-8ff3b2a87486",
+      "name": "Prepare Search Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1296,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://host.docker.internal:8888/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.search_query }}"
+            },
+            {
+              "name": "categories",
+              "value": "images"
+            },
+            {
+              "name": "language",
+              "value": "auto"
+            },
+            {
+              "name": "time_range"
+            },
+            {
+              "name": "safesearch",
+              "value": "0"
+            },
+            {
+              "name": "theme",
+              "value": "simple"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1200
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "fc49ab46-ae26-4868-bf10-4db195d4dc88",
+      "name": "Search Images in SearXNG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -848,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const original = $('Prepare Search Query').item.json;\nlet payload = $json.body ?? $json;\nconst statusCode = Number($json.statusCode ?? 0);\n\nif (typeof payload === 'string') {\n  try {\n    payload = JSON.parse(payload);\n  } catch (error) {\n    return {\n      json: {\n        variant_label: original.variant_label,\n        product_name: original.product_name,\n        image_url: '',\n        image_title: '',\n        image_source_url: '',\n        image_status: 'SEARCH_ERROR',\n        search_query: original.search_query,\n        input_row: original.input_row,\n        search_error: statusCode ? 'SearXNG returned HTTP ' + statusCode + ' (JSON response may be disabled).' : 'SearXNG did not return JSON. Enable the json search format in SearXNG settings.',\n      },\n    };\n  }\n}\n\nif (payload && payload.data && Array.isArray(payload.data.results)) {\n  payload = payload.data;\n}\n\nconst results = Array.isArray(payload?.results) ? payload.results : [];\nconst firstImage = results.find((result) =>\n  typeof result?.img_src === 'string' && /^https?:\\/\\//i.test(result.img_src.trim())\n);\n\nlet imageStatus = firstImage ? 'FOUND' : 'NOT_FOUND';\nlet searchError = '';\nif (statusCode >= 400) {\n  imageStatus = 'SEARCH_ERROR';\n  searchError = 'SearXNG returned HTTP ' + statusCode;\n} else if (!Array.isArray(payload?.results)) {\n  imageStatus = 'SEARCH_ERROR';\n  searchError = 'Unexpected SearXNG response: results[] was missing. Ensure format=json is enabled.';\n}\n\nreturn {\n  json: {\n    variant_label: original.variant_label,\n    product_name: original.product_name,\n    image_url: firstImage?.img_src ?? '',\n    image_title: firstImage?.title ?? '',\n    image_source_url: firstImage?.url ?? '',\n    image_status: imageStatus,\n    search_query: original.search_query,\n    input_row: original.input_row,\n    search_error: searchError,\n  },\n};"
+      },
+      "id": "23dd77a7-3172-427b-869b-45387d46de26",
+      "name": "Pick First Image URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -624,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "c4e4b793-1b4f-4cd5-b32f-51c9f14fe0d8",
+      "name": "Create Result Excel",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1,
+      "position": [
+        -400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "returnBinary",
+        "completionTitle": "Image URL Excel is Ready",
+        "completionMessage": "Your Excel file has been generated and is ready to download.",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "11d938a2-f829-4606-a89d-2ac432c35c71",
+      "name": "Download Result Excel",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        -176,
+        0
+      ],
+      "webhookId": "21e56144-b718-4280-802e-8c0a69031edf"
+    },
+    {
+      "parameters": {
+        "maxItems": 560
+      },
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        -1072,
+        0
+      ],
+      "id": "005ce6da-69c5-4f86-a637-3350cd5914a8",
+      "name": "Limit"
+    }
+  ],
+  "connections": {
+    "Upload Excel": {
+      "main": [
+        [
+          {
+            "node": "Read Excel Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Excel Rows": {
+      "main": [
+        [
+          {
+            "node": "Prepare Search Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Search Query": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Images in SearXNG": {
+      "main": [
+        [
+          {
+            "node": "Pick First Image URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick First Image URL": {
+      "main": [
+        [
+          {
+            "node": "Create Result Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Result Excel": {
+      "main": [
+        [
+          {
+            "node": "Download Result Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit": {
+      "main": [
+        [
+          {
+            "node": "Search Images in SearXNG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
