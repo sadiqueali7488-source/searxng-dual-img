@@ -74,18 +74,56 @@ def is_query_multipack(query: str, variant_label: str = "") -> bool:
     ]
     return any(re.search(p, text) for p in patterns)
 
-def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[str]] = None) -> bool:
-    """Detects if candidate image shows or describes a multi-pack / twin pack / combo."""
+SPECIALTY_FLOUR_MODIFIERS = [
+    'singhara', 'singhada', 'water chestnut', 'kuttu', 'buckwheat',
+    'samak', 'sama', 'rajgira', 'amaranth', 'makka', 'makki', 'maize',
+    'chawal', 'rice flour', 'soya', 'soyabean', 'bajra', 'jowar', 'ragi',
+    'oats', 'oat', 'barley', 'jau', 'khapli', 'emmer', 'beetroot', 'methi',
+    'multigrain', 'multi grain', '7 grain', '7grain', 'missi'
+]
+
+def has_specialty_flour_conflict(target_prod: str, cand_text: str) -> bool:
+    """
+    If target product is a staple (e.g. Atta, Besan, Maida, Sooji) without a specialty modifier,
+    reject candidates that introduce specialty flour varieties (e.g. Singhara Aata for Plain Atta).
+    """
+    p_lower = target_prod.lower()
+    c_lower = cand_text.lower()
+    for spec in SPECIALTY_FLOUR_MODIFIERS:
+        if spec not in p_lower and re.search(rf'\b{re.escape(spec)}\b', c_lower):
+            return True
+    return False
+
+def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[str]] = None, resolution: str = "") -> bool:
+    """Detects if candidate image shows or describes a multi-pack / twin pack / combo / brand range banner / wide collage."""
     ocr_str = " ".join(words or []).lower()
     combined = f"{title.lower()} {url.lower()} {ocr_str}"
     
-    # 1. URL signatures
+    # 1. URL signatures (e.g. Amazon A+ promotional multi-product banners)
+    if any(k in url.lower() for k in ['aplus-media', '/aplus/', 'aplusimaging', 'aplus_data', 'banner']):
+        return True
     if re.search(r'pack[-_]?of[-_]?[2-9]', url.lower()) or 'pack-of-' in url.lower():
         return True
     if any(k in url.lower() for k in ['combo', 'bundle', 'twin-pack', 'twin_pack', 'multipack']):
         return True
 
-    # 2. Text / OCR signatures
+    # 2. Text / OCR signatures of multi-product brand range banners & collages
+    range_patterns = [
+        r'\bexplore\s+(?:the\s+)?(?:wholesome\s+)?range\b',
+        r'\bwholesome\s+range\b',
+        r'\brange\s+of\s+[a-z]+\b',
+        r'\bour\s+range\b',
+        r'\bentire\s+range\b',
+        r'\bcomplete\s+range\b',
+        r'\bproduct\s+range\b',
+        r'\bvariety\s+pack\b',
+        r'\ball\s+variants\b',
+        r'\bwide\s+range\b'
+    ]
+    if any(re.search(p, combined) for p in range_patterns):
+        return True
+
+    # 3. Standard multi-pack patterns
     patterns = [
         r'\bpack\s*of\s*[2-9]\b',
         r'\b[2-9]\s*pack\b',
@@ -101,7 +139,22 @@ def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[
         r'\bmultipack\b',
         r'\bmulti-pack\b'
     ]
-    return any(re.search(p, combined) for p in patterns)
+    if any(re.search(p, combined) for p in patterns):
+        return True
+
+    # 4. Aspect Ratio check for wide horizontal banners or multi-angle stitched collages
+    if resolution:
+        nums = re.findall(r'\d+', resolution)
+        if len(nums) >= 2:
+            w, h = float(nums[0]), float(nums[1])
+            if h > 0:
+                ratio = w / h
+                # Single packshots are square or portrait (0.55 <= ratio <= 1.50).
+                # Banners and 3-pack collages have ratio > 1.52 or < 0.50
+                if ratio > 1.52 or ratio < 0.50:
+                    return True
+
+    return False
 
 def has_any_size_callout(words: List[str], title: str = "", url: str = "") -> bool:
     """Checks if image text, title, or url mentions any package size (e.g. 1kg, 500g, 5kg)."""
@@ -289,6 +342,10 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
     p_lower = product_name.lower().strip()
     b_lower = (brand or "").lower().strip()
 
+    # 0. SPECIALTY FLOUR CONFLICT CHECK (e.g. Singhara Aata for Plain Atta)
+    if has_specialty_flour_conflict(p_lower, full_text):
+        return False
+
     # 1. UNIVERSAL PRODUCT TOKEN MATCHING:
     # Extracts clean product tokens (excluding brand words, stop words, and unit tokens)
     b_tokens = set(re.split(r'[\s\-_]+', b_lower))
@@ -443,9 +500,13 @@ def score_and_rank_images(
         if brand and not is_dynamic_brand_match(combined, brand):
             continue
 
-        # 3. MULTI-PACK VS SINGLE PACK FILTER
-        cand_is_combo = is_candidate_multipack(title, f"{img_url} {page_url}")
+        # 3. MULTI-PACK VS SINGLE PACK FILTER (including A+ banners & collages)
+        cand_is_combo = is_candidate_multipack(title, f"{img_url} {page_url}", resolution=item.get("resolution", ""))
         if not query_is_combo and cand_is_combo:
+            continue
+
+        # 3.1 SPECIALTY FLOUR CONFLICT CHECK
+        if has_specialty_flour_conflict(prod_clean, combined):
             continue
 
         # 4. MILLET SPECIES CONFLICT FILTER
@@ -703,8 +764,8 @@ async def search_searxng_image(
             title = candidate.title
             cand_context = f"{title} {cand_url} {page_url}"
 
-            # Multi-pack check
-            cand_multi = is_candidate_multipack(title, cand_context)
+            # Multi-pack check (with aspect ratio & A+ banner protection)
+            cand_multi = is_candidate_multipack(title, cand_context, resolution=candidate.resolution)
             if not query_is_combo and cand_multi:
                 continue
             if query_is_combo and not cand_multi:
@@ -720,8 +781,8 @@ async def search_searxng_image(
             img_to_ocr = candidate.thumbnail_src or candidate.img_src
             words = await extract_image_ocr_text(client, img_to_ocr, timeout=1.5)
 
-            # Re-verify multi-pack with OCR text
-            if not query_is_combo and is_candidate_multipack(title, cand_context, words):
+            # Re-verify multi-pack with OCR text & resolution
+            if not query_is_combo and is_candidate_multipack(title, cand_context, words, resolution=candidate.resolution):
                 continue
 
             # Re-verify brand and category with OCR text
@@ -747,7 +808,7 @@ async def search_searxng_image(
         if selected_index == -1:
             for idx, candidate in enumerate(candidate_items):
                 cand_context = f"{candidate.title} {candidate.img_src} {candidate.url}"
-                cand_multi = is_candidate_multipack(candidate.title, cand_context)
+                cand_multi = is_candidate_multipack(candidate.title, cand_context, resolution=candidate.resolution)
                 if not query_is_combo and cand_multi:
                     continue
 
