@@ -377,7 +377,7 @@ class JobManager:
             if not clean_p_name:
                 clean_p_name = prod_name
 
-            # Query 1: Product Image (WITHOUT SIZE) -> brand + clean_p_name
+            # Query 1: Product Image (WITHOUT SIZE) -> brand + clean_p_name + front packaging pouch
             p_parts = []
             if config.query_prefix:
                 p_parts.append(config.query_prefix.strip())
@@ -387,9 +387,11 @@ class JobManager:
                 p_parts.append(clean_p_name)
             if config.query_suffix:
                 p_parts.append(config.query_suffix.strip())
+            else:
+                p_parts.append("front packaging pouch")
             product_query = sanitize_search_query(" ".join(p_parts).strip() or clean_p_name or brand or "product")
 
-            # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label
+            # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label + front packaging pack
             v_parts = []
             if config.query_prefix:
                 v_parts.append(config.query_prefix.strip())
@@ -401,6 +403,8 @@ class JobManager:
                 v_parts.append(variant)
             if config.query_suffix:
                 v_parts.append(config.query_suffix.strip())
+            else:
+                v_parts.append("front packaging pack")
             variant_query = sanitize_search_query(" ".join(v_parts).strip() or product_query)
 
             job.row_results.append(RowResult(

@@ -343,7 +343,7 @@ async def search_searxng_image(
     params = {
         "q": clean_q,
         "category_images": 1,
-        "engines": "bing images,brave.images",
+        "engines": "google images,bing images,brave.images",
         "pageno": 1,
         "language": language,
         "time_range": time_range,

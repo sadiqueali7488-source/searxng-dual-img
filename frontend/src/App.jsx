@@ -371,12 +371,14 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     if (!uploadData || !uploadData.preview || uploadData.preview.length === 0) return '';
     const row = uploadData.preview[0];
     const brand = row['brand_name'] || row['brand'] || '';
-    const name = row[queryColumn] || '';
+    let name = row[queryColumn] || '';
+    name = name.replace(/\b\d+(\.\d+)?\s*(kg|g|gm|gms|ml|l|ltr|pack\s+of\s+\d+|pcs|pieces)\b/gi, '').trim();
     const parts = [];
     if (queryPrefix) parts.push(queryPrefix);
     if (brand && !name.toLowerCase().includes(brand.toLowerCase())) parts.push(brand);
     if (name) parts.push(name);
     if (querySuffix) parts.push(querySuffix);
+    else parts.push('front packaging pouch');
     return parts.filter(Boolean).join(' ').trim();
   };
 
@@ -392,6 +394,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     if (name) parts.push(name);
     if (variant && !name.toLowerCase().includes(variant.toLowerCase())) parts.push(variant);
     if (querySuffix) parts.push(querySuffix);
+    else parts.push('front packaging pack');
     return parts.filter(Boolean).join(' ').trim();
   };
 
@@ -573,7 +576,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                   2
                 </div>
                 <h2 className="text-sm font-semibold text-white tracking-wide">
-                  Imran Sir's Dual Image Strategy
+                  Smart Dual Front Packshot Engine (AI OCR)
                 </h2>
               </div>
 
