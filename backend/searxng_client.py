@@ -13,13 +13,13 @@ from models import ImageResult
 
 logger = logging.getLogger("searxng_client")
 
-# Initialize PP-OCRv6 Medium (PaddleOCR ONNX backend)
+# Two-stage PP-OCRv6 (fast small model to screen, strict medium model to confirm)
 try:
-    from ocr_engine import run_ocr
-    logger.info("PP-OCRv6 Medium (PaddleOCR ONNX backend) initialized successfully.")
+    from ocr_engine import run_ocr_full
+    logger.info("PP-OCRv6 two-stage OCR (PaddleOCR ONNX backend) initialized successfully.")
 except Exception as e:
-    logger.warning(f"PP-OCRv6 Medium failed to initialize: {e}")
-    run_ocr = None
+    logger.warning(f"PP-OCRv6 failed to initialize: {e}")
+    run_ocr_full = None
 
 # OCR text and search results are cached on disk (cache_store) so nothing is done twice
 import cache_store
@@ -27,6 +27,57 @@ import cache_store
 # Images OCR'd at the same time per search (the OCR pool runs them in parallel)
 OCR_BATCH = 4
 MAX_ALTERNATIVES = 8
+# Border-uniformity score (ocr_engine.packshot_quality) at or above which an image counts as a clean packshot.
+# Lower scores are lifestyle photos or cropped / half-cut packs: used only when no clean packshot exists.
+CLEAN_PACKSHOT_QUALITY = 0.6
+# Store image CDNs that only serve plain packshots (some fill the frame edge to edge, which lowers
+# the border score even though the photo is clean)
+CLEAN_PACKSHOT_HOSTS = ['bbassets.com', 'media-amazon.com', 'grofers.com', 'instamart-media-assets.swiggy.com',
+                        'rukminim', 'flixcart.com', 'dmart.in', 'jiomart.com']
+# Design portfolios / packaging blogs: mockups and renders, never the exact pick
+MOCKUP_HOSTS = ['blogspot', 'behance.net', 'dribbble', 'packagingoftheworld', 'adgully', 'artstation']
+
+def is_clean_packshot(img_url: str, quality: float) -> bool:
+    url = (img_url or "").lower()
+    if any(h in url for h in MOCKUP_HOSTS):
+        return False
+    return quality >= CLEAN_PACKSHOT_QUALITY or any(h in _host(url) for h in CLEAN_PACKSHOT_HOSTS)
+
+# Below this border score an image is a lifestyle scene, a banner or a half-cut close-up: never used
+# (measured: cropped close-up 0.05, ad banner 0.00, kitchen-table photo 0.11; packshots 0.45-1.0)
+MIN_PACKSHOT_QUALITY = 0.25
+# ocr_engine.repeated_pack_score at or below this = the same pack photographed 2-3 times side by side
+# (measured: identical 2-pack 0.07, single packs 0.39-0.80)
+REPEATED_PACK_MAX = 0.2
+
+# Text found on ads and promo banners, never on a pack front
+BANNER_PATTERNS = [
+    r'\bswitch\s+to\b', r'\bshop\s+now\b', r'\bbuy\s+now\b', r'\border\s+now\b', r'\bavailable\s+(?:on|at)\b',
+    r'\bdownload\s+the\s+app\b', r'\bfree\s+delivery\b', r'\bcash\s+on\s+delivery\b', r'\bflat\s+\d+\s*%\s*off\b',
+]
+
+def is_banner_or_composite(words: List[str], brand: str = "") -> bool:
+    """Ad banners, and listing images showing alternatives ('pouch OR bottle', 'packaging may vary')."""
+    ocr = " ".join(words or []).lower()
+    if any(re.search(p, ocr) for p in BANNER_PATTERNS):
+        return True
+    if re.search(r'packaging\s+m(?:ay|ight)\s+vary', ocr):
+        return True
+    # A standalone "OR" between two copies of the brand: two different packs offered as alternatives
+    main = max((t for t in _brand_tokens(brand) if len(t) >= 4), key=len, default="")
+    if any(w.strip() == "or" for w in words or []) and main and sum(1 for w in words if main in w) >= 2:
+        return True
+    return False
+
+# Part of every search-cache key: bump it whenever the selection rules change, so results chosen
+# under older (weaker) rules are never served from the cache again
+SEARCH_RULES_VERSION = "rules-5"
+# Part of every OCR-cache key: bump when ocr_engine returns new fields
+OCR_CACHE_VERSION = "v2"
+
+# Recently downloaded images, so the strict second OCR pass does not download them again
+_IMAGE_BYTES: "Dict[str, bytes]" = {}
+_IMAGE_BYTES_MAX = 400
 
 # Image CDNs often block non-browser clients; without this many downloads (and so OCR) fail.
 BROWSER_HEADERS = {
@@ -70,7 +121,7 @@ def normalize_url(url: Optional[str]) -> str:
     if url.startswith("//"):
         url = "https:" + url
     # BigBasket: replace secondary image indices (_2-, _3-, _4-) with primary front packshot (_1-)
-    if 'bbassets' in url.lower():
+    if 'bbassets' in url.lower() or 'bigbasket.com/media/uploads/p/' in url.lower():
         url = re.sub(r'(\d+)_[2-9]-', r'\g<1>_1-', url)
     return url
 
@@ -93,31 +144,128 @@ async def _download_image(client: httpx.AsyncClient, url: str, timeout: float) -
     except Exception:
         return None
 
-async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, fallback_url: str = "", timeout: float = 6.0) -> List[str]:
+async def read_image(client: httpx.AsyncClient, img_url: str, fallback_url: str = "",
+                     stage: str = "fast", timeout: float = 6.0) -> Dict[str, Any]:
     """
-    Downloads the FULL image (falling back to the search thumbnail) and runs PP-OCRv6 Medium.
-    Small thumbnails hide nutrition tables / batch text, so back panels were slipping through.
-    Returns [] when the image could not be downloaded; failures are not cached (may be temporary).
+    Downloads the FULL image (falling back to the search thumbnail) and runs PP-OCRv6.
+    stage='fast' screens candidates; stage='strict' is the second, more accurate read.
+    Returns {"words": [...], "quality": 0..1}; words is [] when the image could not be downloaded.
+    Failures are not cached (may be temporary).
     """
-    if not img_url or run_ocr is None:
-        return []
+    empty = {"words": [], "quality": 0.0, "repeat": 9.0}
+    if not img_url or run_ocr_full is None:
+        return empty
 
-    cached = cache_store.get_ocr(img_url)
-    if cached is not None:
+    key = f"{stage}:{OCR_CACHE_VERSION}:{img_url}"
+    cached = cache_store.get_ocr(key)
+    if isinstance(cached, dict):
         return cached
 
-    content = await _download_image(client, img_url, timeout)
-    if content is None and fallback_url and fallback_url != img_url:
-        content = await _download_image(client, fallback_url, timeout)
+    content = _IMAGE_BYTES.get(img_url)
     if content is None:
-        return []
+        content = await _download_image(client, img_url, timeout)
+        if content is None and fallback_url and fallback_url != img_url:
+            content = await _download_image(client, fallback_url, timeout)
+        if content is None:
+            return empty
+        if len(_IMAGE_BYTES) >= _IMAGE_BYTES_MAX:
+            _IMAGE_BYTES.pop(next(iter(_IMAGE_BYTES)))
+        _IMAGE_BYTES[img_url] = content
 
     try:
-        words = await run_ocr(content)
+        result = await run_ocr_full(content, stage)
     except Exception:
-        return []
-    cache_store.put_ocr(img_url, words)
-    return words
+        return empty
+    cache_store.put_ocr(key, result)
+    return result
+
+async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, fallback_url: str = "", timeout: float = 6.0) -> List[str]:
+    """Fast-stage OCR text of an image (see read_image)."""
+    return (await read_image(client, img_url, fallback_url, "fast", timeout))["words"]
+
+def _brand_tokens(brand: str) -> List[str]:
+    return [t for t in re.split(r'[\s\-_,()/&.]+', (brand or "").lower()) if t]
+
+def _token_present(token: str, text: str, compact: str) -> bool:
+    """Short tokens ('bb', 'mp', '24') must be whole words; longer ones may be glued ('aashirvaadatta')."""
+    if len(token) <= 3:
+        return bool(re.search(rf'(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])', text))
+    return token in compact
+
+def brand_on_pack(words: List[str], brand: str) -> bool:
+    """The brand is printed on the pack: the whole brand ('bb royal' / 'bbroyal'), or every brand word."""
+    if not brand:
+        return True
+    ocr = " ".join(words or []).lower()
+    compact = re.sub(r'[^a-z0-9]', '', ocr)
+    full = re.sub(r'[^a-z0-9]', '', brand.lower())
+    if len(full) >= 4 and full in compact:
+        return True
+    tokens = [t for t in _brand_tokens(brand) if t not in {'organic', 'foods', 'food', 'pvt', 'ltd', 'india'}]
+    if tokens and all(_token_present(t, ocr, compact) for t in tokens):
+        return True
+    # Logos often hide the small part of a brand ('bb' above 'ROYAL'): the main word is enough on the
+    # pack, because the full brand is still checked against title + pack by is_dynamic_brand_match
+    long_tokens = [t for t in tokens if len(t) >= 4]
+    distinctive = [t for t in long_tokens if t not in GENERIC_BRAND_WORDS]
+    # "bb Royal": 'royal' is a generic word elsewhere, but it is still this brand's main word
+    main = max(distinctive or long_tokens, key=len, default="")
+    return bool(main) and main in compact
+
+def ocr_repeats_multipack(words: List[str], brand: str = "") -> bool:
+    """
+    Several packs in one image: OCR reads the brand / the same claims once per pack.
+    e.g. 3 x 24 Mantra Rice Flour -> 'mantra' x3, 'gluten free' x3, 'truly ghar ka khana' x3.
+    A single pack may print its name twice (top and bottom band), so the threshold is 3.
+    """
+    if not words:
+        return False
+    lines = [re.sub(r'[^a-z0-9]', '', w) for w in words]
+    lines = [l for l in lines if len(l) >= 4]
+    main = max((t for t in _brand_tokens(brand) if len(t) >= 4 and t not in GENERIC_BRAND_WORDS), key=len, default="")
+    if main and sum(1 for l in lines if main in l) >= 3:
+        return True
+    # OCR reads each copy slightly differently ("truly ghar ka khana" / "truly char ka khana"),
+    # so lines are grouped by similarity, not exact equality
+    from difflib import SequenceMatcher
+    groups: List[List[str]] = []
+    for l in lines:
+        for g in groups:
+            if l == g[0] or (len(l) >= 8 and SequenceMatcher(None, l, g[0]).ratio() >= 0.8):
+                g.append(l)
+                break
+        else:
+            groups.append([l])
+    return sum(1 for g in groups if len(g) >= 3) >= 2
+
+# Words that make a DIFFERENT product variant. If the listing / pack has one that the Excel name
+# doesn't, it is the wrong product ("Aashirvaad Organic Atta" is not "Aashirvaad Atta").
+VARIANT_MODIFIERS = [
+    'organic', 'select', 'superior', 'mp', 'sugar release', 'sugar control', 'low gi', 'diet', 'lite',
+    'sugar free', 'sugarfree', 'no added sugar', 'low fat', 'fat free', 'low sodium', 'unsalted',
+    'double toned', 'toned', 'skimmed', 'full cream', 'high fibre', 'high fiber',
+    'millet', 'millets', 'multigrain', 'multigrains', 'multi grain', 'multi grains',
+]
+# Checked in the title only: packs often print these as claims ("rich in protein")
+TITLE_ONLY_MODIFIERS = ['protein', 'high protein', 'kids', 'baby', 'junior', 'mini', 'jumbo', 'refill', 'travel', 'sample']
+
+def has_variant_conflict(title: str, words: List[str], product_name: str, brand: str = "") -> bool:
+    name = f"{product_name} {brand}".lower()
+    t = (title or "").lower()
+    ocr = " ".join(words or []).lower()
+    for m in VARIANT_MODIFIERS:
+        pat = rf'(?<![a-z0-9]){re.escape(m)}(?![a-z0-9])'
+        # singular / plural of a word in the name is the same variant ("Multigrain" vs "Multigrains")
+        stem = re.sub(r's$', '', m)
+        if re.search(pat, name) or re.search(rf'(?<![a-z0-9]){re.escape(stem)}s?(?![a-z0-9])', name):
+            continue
+        if re.search(pat, t) or re.search(pat, ocr):
+            return True
+    for m in TITLE_ONLY_MODIFIERS:
+        pat = rf'(?<![a-z0-9]){re.escape(m)}(?![a-z0-9])'
+        if not re.search(pat, name) and re.search(pat, t):
+            return True
+    return False
 
 def ocr_shows_front(words: List[str], brand: str = "", product_name: str = "") -> bool:
     """
@@ -130,9 +278,21 @@ def ocr_shows_front(words: List[str], brand: str = "", product_name: str = "") -
     compact = re.sub(r'[^a-z0-9]', '', ocr)
     if not brand and not product_name:
         return True
-    tokens = [t for t in re.split(r'[\s\-_,()/&]+', f"{brand} {product_name}".lower())
-              if len(t) >= 4 and t not in GENERIC_BRAND_WORDS and not re.match(r'^\d', t)]
-    return any(t in compact for t in tokens) if tokens else True
+    product_tokens = [t for t in re.split(r'[\s\-_,()/&]+', product_name.lower())
+                      if len(t) >= 4 and t not in GENERIC_BRAND_WORDS and not re.match(r'^\d', t)
+                      and t not in _brand_tokens(brand)]
+    # Brand printed on the pack is the strongest front evidence; with only the logo word read
+    # (an infographic or banner showing just "ROYAL"), a product word must be printed too
+    if brand and brand_on_pack(words, brand):
+        full = re.sub(r'[^a-z0-9]', '', brand.lower())
+        if (len(full) >= 4 and full in compact) or not product_tokens or any(t in compact for t in product_tokens):
+            return True
+    # When the Excel name itself starts with the brand ("bb Royal Chakki Atta"), the front MUST show it:
+    # infographics and recipe cards ("chakki atta laddoo...") carry the product words but no brand
+    if brand and re.sub(r'[^a-z0-9]', '', brand.lower()) in re.sub(r'[^a-z0-9]', '', product_name.lower()):
+        return False
+    # Sub-brands (product "Maggi Noodles", brand "Nestle"): accept when the product name is printed on the pack
+    return any(t in compact for t in product_tokens) if product_tokens else not brand
 
 def is_query_multipack(query: str, variant_label: str = "") -> bool:
     """Detects if user query or variant specifies a multi-pack, combo, or bundle."""
@@ -156,6 +316,17 @@ SPECIALTY_FLOUR_MODIFIERS = [
     'multigrain', 'multi grain', '7 grain', '7grain', 'missi'
 ]
 
+# Grocery staples that are never each other (only checked when the Excel product is one of them)
+STAPLE_CATEGORY_WORDS = ['atta', 'rice', 'basmati', 'dal', 'oil', 'ghee', 'salt', 'sugar', 'tea', 'coffee',
+                         'besan', 'maida', 'sooji', 'suji', 'poha', 'jaggery']
+
+GRAIN_ALIAS_GROUPS = [
+    ['khapli', 'emmer'], ['kuttu', 'buckwheat'], ['singhara', 'singhada', 'water chestnut'],
+    ['rajgira', 'amaranth'], ['makka', 'makki', 'maize'], ['jau', 'barley'], ['samak', 'sama'],
+    ['chawal', 'rice flour'], ['soya', 'soyabean'], ['multigrain', 'multi grain'], ['7 grain', '7grain'],
+    ['ragi', 'nachni', 'finger millet'], ['jowar', 'sorghum'], ['bajra', 'pearl millet'],
+]
+
 def has_specialty_flour_conflict(target_prod: str, cand_text: str) -> bool:
     """
     If target product is a staple (e.g. Atta, Besan, Maida, Sooji) without a specialty modifier,
@@ -164,7 +335,12 @@ def has_specialty_flour_conflict(target_prod: str, cand_text: str) -> bool:
     p_lower = target_prod.lower()
     c_lower = cand_text.lower()
     for spec in SPECIALTY_FLOUR_MODIFIERS:
-        if spec not in p_lower and re.search(rf'\b{re.escape(spec)}\b', c_lower):
+        if spec in p_lower:
+            continue
+        # Local and English names of the SAME grain are not a conflict (Khapli atta says "emmer wheat")
+        if any(spec in group and any(alias in p_lower for alias in group) for group in GRAIN_ALIAS_GROUPS):
+            continue
+        if re.search(rf'\b{re.escape(spec)}\b', c_lower):
             return True
     return False
 
@@ -309,7 +485,9 @@ def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[
         r'\b[2-9]\s*x\s*\d+\s*(?:kg|g|gm|l|ml)\b',
         r'\b\d+(?:\.\d+)?\s*(?:kg|g|gm|l|ml)\s*\+\s*\d+(?:\.\d+)?\s*(?:kg|g|gm|l|ml)\b',
         r'\bmultipack\b',
-        r'\bmulti-pack\b'
+        r'\bmulti-pack\b',
+        r'\bmulti\s+pack\b',
+        r'\b[2-9]\s*packs\b'      # OCR reads "5" and "PACKS" as separate lines; they are joined with a space
     ]
     if any(re.search(p, combined) for p in patterns):
         return True
@@ -489,7 +667,9 @@ def is_dynamic_brand_match(full_text: str, target_brand: str, ocr_words: Optiona
     clean_b_str = re.sub(r'[^a-z0-9]', '', b_clean)
     clean_comb_str = re.sub(r'[^a-z0-9]', '', combined)
 
-    if clean_b_str in clean_comb_str:
+    # Short brands ('MTR', '9AM', 'bb') must be whole words: as a substring they match random
+    # URL hashes (".../216490_99bc311420bb4af..." matched 'bb' and let the US brand "Royal" in)
+    if _token_present(clean_b_str, combined, clean_comb_str) if len(clean_b_str) <= 3 else clean_b_str in clean_comb_str:
         return True
 
     # Brand transliteration aliases (e.g. Aahar <-> Ahaar)
@@ -512,14 +692,14 @@ def is_dynamic_brand_match(full_text: str, target_brand: str, ocr_words: Optiona
         t = tokens[0]
         trans_t = BRAND_TRANSLITERATIONS.get(t)
         return bool(
-            re.search(rf'\b{re.escape(t)}\b', combined) or t in clean_comb_str or
-            (trans_t and (re.search(rf'\b{re.escape(trans_t)}\b', combined) or trans_t in clean_comb_str))
+            _token_present(t, combined, clean_comb_str) or
+            (trans_t and _token_present(trans_t, combined, clean_comb_str))
         )
 
     # Multi-word brand (e.g. "bb Super Saver", "bb Royal", "Tata Sampann", "Tata Salt"):
     matched_count = 0
     for t in tokens:
-        if re.search(rf'\b{re.escape(t)}\b', combined) or t in clean_comb_str:
+        if _token_present(t, combined, clean_comb_str):
             matched_count += 1
 
     match_ratio = matched_count / len(tokens)
@@ -530,7 +710,7 @@ def is_dynamic_brand_match(full_text: str, target_brand: str, ocr_words: Optiona
     else:
         # For 3+ words (e.g. 'bb super saver'): at least 67% must match AND primary first token must match
         first_token = tokens[0]
-        first_matches = bool(re.search(rf'\b{re.escape(first_token)}\b', combined) or first_token in clean_comb_str)
+        first_matches = _token_present(first_token, combined, clean_comb_str)
         return match_ratio >= 0.67 and first_matches
 
 def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") -> bool:
@@ -549,6 +729,8 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
     if not product_name:
         return True
     ocr_str = " ".join(words or []).lower()
+    # Negative claims name OTHER products: "0% maida 100% atta" on an atta pack is not maida
+    ocr_str = re.sub(r'(?:0\s*%|no|zero|without|free\s+from|non)[\s-]*(maida|sugar|palm\s*oil|oil|msg|preservatives?|gluten|added\s+\w+)', ' ', ocr_str)
     full_text = f"{ocr_str} {title} {url}".lower()
     p_lower = product_name.lower().strip()
     b_lower = (brand or "").lower().strip()
@@ -608,6 +790,22 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
             for sib in siblings:
                 if sib not in p_lower and re.search(rf'\b{re.escape(sib)}\b', full_text):
                     return False
+
+    # 4.1 Staple category lock: an Atta listing that also shows Rice / Dal / Oil is another product or a
+    # combo (bb Royal "Basmati Rice + Chakki Atta value pack"). Flour products naturally say "atta".
+    staple_text = f"{ocr_str} {title} {url}".lower().replace("-", " ").replace("_", " ")
+    staple_text = re.sub(r'rice\s*bran', ' ', staple_text)   # "rice bran oil" is an oil, not rice
+    target_staples = {s for s in STAPLE_CATEGORY_WORDS if re.search(rf'\b{s}\b', p_lower)}
+    if 'flour' in p_lower:
+        target_staples.add('atta')
+    if target_staples:
+        for other in STAPLE_CATEGORY_WORDS:
+            if other in target_staples or (other == 'rice' and 'basmati' in target_staples):
+                continue
+            if other == 'basmati' and 'rice' in target_staples:
+                continue
+            if re.search(rf'\b{other}\b', staple_text):
+                return False
 
     # 5. MILLET SPECIES LOCK:
     MILLET_GROUPS = {
@@ -909,7 +1107,7 @@ async def search_searxng_image(
     # The product image (without size) is the same for every size of a product: leave size out of its key
     size_key = variant_label if (is_variant or is_query_multipack(product_name, variant_label)) else ""
     key = hashlib.sha1(json.dumps(
-        [base_url.rstrip("/"), clean_q, brand, product_name, size_key, is_variant, safesearch, time_range, language, top_limit]
+        [SEARCH_RULES_VERSION, base_url.rstrip("/"), clean_q, brand, product_name, size_key, is_variant, safesearch, time_range, language, top_limit]
     ).encode()).hexdigest()
 
     cached = cache_store.get_search(key)
@@ -931,6 +1129,17 @@ async def search_searxng_image(
     # Each row cycles through its own alternatives list
     return {**result, "alternatives": list(result.get("alternatives", []))}
 
+QUERY_SUFFIXES = [
+    "single pack front packaging", "combo pack front packaging",
+    "front packaging pouch", "front view product shot",
+]
+
+def _strip_suffix(query: str) -> str:
+    q = query
+    for s in QUERY_SUFFIXES:
+        q = re.sub(re.escape(s), " ", q, flags=re.I)
+    return re.sub(r"\s+", " ", q).strip()
+
 async def _search_uncached(
     client: httpx.AsyncClient,
     base_url: str,
@@ -945,27 +1154,86 @@ async def _search_uncached(
     top_limit: int = 20
 ) -> Dict[str, Any]:
     """
-    Search SearXNG + PaddleOCR Strict Inspection Pipeline:
-    - Fetches top 20 candidate images from SearXNG.
-    - Runs PaddleOCR & Vision inspection on candidates sequentially:
-      * For Product Image (WITHOUT SIZE):
-        Strictly rejects images with size badges (1kg, 500g, etc.) and picks clean general packshot.
-      * For Variant Image (WITH SIZE):
-        Strictly requires exact variant size printed on packet. If candidate #1 doesn't have it,
-        auto-advances to candidate #2, #3... until exact matching size is found!
-      * Strictly rejects multi-packs/twin-packs when query asks for single pack.
-      * Strictly rejects competitor brands and partial generic word matches.
+    Automatic retry ladder: stops at the first attempt that finds an EXACT image.
+      1. the query as built (e.g. "... single pack front packaging")
+      2. the plain query (brand + product [+ size]): different, often better results
+      3. page 2 of the plain query
+    If no attempt is exact, the best fallback (right brand + product front) from any attempt is used.
+    """
+    clean_q = sanitize_search_query(query)
+    plain_q = _strip_suffix(clean_q) or clean_q
+    attempts = [(clean_q, 1)]
+    if plain_q.lower() != clean_q.lower():
+        attempts.append((plain_q, 1))
+    attempts.append((plain_q, 2))
+
+    seen: set = set()
+    fallback_result: Optional[Dict[str, Any]] = None
+    extra_alts: List[ImageResult] = []
+    errors: List[str] = []
+    for q, page in attempts:
+        res = await _search_once(client, base_url, q, page, brand, product_name, variant_label,
+                                 is_variant, safesearch, time_range, language, top_limit, seen)
+        if res["status"] == "ERROR":
+            errors.append(res.get("error_message") or "error")
+            continue
+        # Stop retrying on an exact match, or (without size) on a verified clean packshot that merely shows its size
+        if res["status"] == "SUCCESS" and (res.get("match") == "exact" or (not is_variant and res.get("clean"))):
+            res["alternatives"] = (res["alternatives"] + extra_alts)[:MAX_ALTERNATIVES]
+            return res
+        if res["status"] == "SUCCESS" and fallback_result is None:
+            fallback_result = res
+        else:
+            extra_alts.extend(res.get("alternatives", []))
+
+    if fallback_result:
+        fallback_result["alternatives"] = (fallback_result["alternatives"] + extra_alts)[:MAX_ALTERNATIVES]
+        return fallback_result
+    if errors and len(errors) == len(attempts):
+        return {"status": "ERROR", "best_image": None, "alternatives": [], "error_message": errors[0]}
+    return {
+        "status": "NOT_FOUND",
+        "best_image": None,
+        "alternatives": extra_alts[:MAX_ALTERNATIVES],
+        "error_message": f"No verified image matching brand '{brand}' and product '{product_name}'"
+    }
+
+async def _search_once(
+    client: httpx.AsyncClient,
+    base_url: str,
+    clean_q: str,
+    page: int,
+    brand: str,
+    product_name: str,
+    variant_label: str,
+    is_variant: bool,
+    safesearch: int,
+    time_range: str,
+    language: str,
+    top_limit: int,
+    seen: set
+) -> Dict[str, Any]:
+    """
+    Search SearXNG + two-stage PP-OCRv6 Strict Inspection Pipeline:
+    - Fetches candidate images from SearXNG (Google Images, Bing fallback).
+    - Stage 1 (fast OCR) screens candidates in rank order; Stage 2 (strict OCR, medium model)
+      re-reads the image before it is accepted. Both reads must pass every rule:
+      * front of pack only: readable, not a back panel / nutrition table, brand (or product) printed on it
+      * one single pack (no combos, no 2-3 packs in one image) unless a combo is asked
+      * right brand, right product, no extra variant words (Organic, Select, Lite...)
+      * WITH SIZE: exact size; WITHOUT SIZE: clean packshot without a size badge preferred
+      * clean e-commerce packshot preferred over lifestyle photos and cropped / half-cut packs
+    Returns status SUCCESS / NOT_FOUND / ERROR and match 'exact' / 'fallback'.
+    Candidates already inspected by an earlier attempt (`seen`) are skipped.
     """
     base_url = base_url.rstrip("/")
     search_url = f"{base_url}/search"
-
-    clean_q = sanitize_search_query(query)
 
     params = {
         "q": clean_q,
         "category_images": 1,
         "engines": "google images",
-        "pageno": 1,
+        "pageno": page,
         "language": language,
         "time_range": time_range,
         "safesearch": safesearch,
@@ -1028,10 +1296,10 @@ async def _search_uncached(
             direct_img = img_src or thumbnail_src
             thumb = thumbnail_src or img_src
 
-            if direct_img:
+            if direct_img and direct_img not in seen:
                 if is_blocked_source(direct_img, page_url):
                     continue
-
+                seen.add(direct_img)
                 candidate_items.append(ImageResult(
                     title=title,
                     img_src=direct_img,
@@ -1051,27 +1319,13 @@ async def _search_uncached(
 
         query_is_combo = is_query_multipack(product_name, variant_label)
 
-        async def inspect(candidate: ImageResult) -> str:
-            """
-            'exact'    -> passes the strict rules (exact size / clean packshot)
-            'fallback' -> right brand + product front, but strict size/clean rule not met
-            'reject'   -> wrong product, back panel, multi-pack, unreadable, or other size
-            """
+        def judge(candidate: ImageResult, read: Dict[str, Any], meta_ok: bool) -> str:
+            """Applies every rule to one OCR read: 'exact', 'fallback' or 'reject'."""
+            words = read["words"]
+            quality = read.get("quality", 0.0)
             cand_url = candidate.img_src
             title = candidate.title
             cand_context = f"{title} {cand_url} {candidate.url}"
-
-            # Cheap metadata checks first: no download/OCR for obvious rejects
-            cand_multi = is_candidate_multipack(title, cand_context, resolution=candidate.resolution)
-            if cand_multi != query_is_combo:
-                return "reject"
-            if is_back_panel_or_nutrition(title, cand_url):
-                return "reject"
-            meta_ok = is_dynamic_brand_match(cand_context, brand) and \
-                verify_product_keyword_match([], title, product_name, brand, cand_context)
-
-            # Run OCR on the full packaging image (thumbnail only if the full image can't be downloaded)
-            words = await extract_image_ocr_text(client, cand_url, candidate.thumbnail_src)
 
             # FRONT-ONLY RULE: the image must be readable, must not be a back panel,
             # and must show the brand or product name printed on it
@@ -1080,47 +1334,124 @@ async def _search_uncached(
             if not ocr_shows_front(words, brand, product_name):
                 return "reject"
 
-            # Re-verify multi-pack, brand and category with OCR text
-            if not query_is_combo and is_candidate_multipack(title, cand_context, words, resolution=candidate.resolution):
+            # PROPER PHOTO: no lifestyle scenes, half-cut close-ups, ad banners or "pouch OR bottle" composites
+            if quality < MIN_PACKSHOT_QUALITY and not any(h in _host(cand_url) for h in CLEAN_PACKSHOT_HOSTS):
                 return "reject"
+            if is_banner_or_composite(words, brand):
+                return "reject"
+
+            # ONE PACK ONLY: combos, "pack of 2", and 2-3 packs photographed together
+            if not query_is_combo and (
+                is_candidate_multipack(title, cand_context, words, resolution=candidate.resolution)
+                or ocr_repeats_multipack(words, brand)
+                or read.get("repeat", 9.0) <= REPEATED_PACK_MAX
+            ):
+                return "reject"
+
+            # Right brand, right product, no extra variant (Organic / Select / Lite ...)
             if not is_dynamic_brand_match(cand_context, brand, words):
                 return "reject"
             if not verify_product_keyword_match(words, title, product_name, brand, cand_context):
                 return "reject"
+            if has_variant_conflict(title, words, product_name, brand):
+                return "reject"
 
+            clean = is_clean_packshot(cand_url, quality)
             if is_variant and variant_label:
                 # WITH SIZE: Must contain exact variant size on pack / title / url
-                if meta_ok and verify_size_strict(words, title, variant_label, cand_context):
+                if _ocr_shows_other_size(words, variant_label):
+                    return "reject"
+                if meta_ok and clean and verify_size_strict(words, title, variant_label, cand_context):
                     return "exact"
-                return "reject" if _ocr_shows_other_size(words, variant_label) else "fallback"
-            # WITHOUT SIZE: prefer a pack without a size callout (1kg, 500g, etc.)
-            if meta_ok and not has_any_size_callout(words, title, cand_url):
+                return "fallback"
+            # WITHOUT SIZE: prefer a clean pack without a size callout (1kg, 500g, etc.)
+            if meta_ok and clean and not has_any_size_callout(words, title, cand_url):
                 return "exact"
             return "fallback"
 
-        # Step 2: Strict Vision / PP-OCRv6 Inspection in rank order.
-        # The top-ranked image is checked alone first (it is usually the right front, so most
-        # searches need a single OCR); after that OCR_BATCH candidates are checked in parallel.
-        # Stops at the first batch containing an exact match.
+        meta_ok_map: Dict[str, bool] = {}
+
+        async def screen(candidate: ImageResult) -> str:
+            """
+            Metadata checks + Stage 1 (fast OCR):
+            'exact'    -> passes the strict rules (pending Stage 2 confirmation)
+            'fallback' -> right brand + product front, but a strict rule (size / clean packshot) not met
+            'reject'   -> wrong product, back panel, multi-pack, unreadable, or other size
+            """
+            cand_url = candidate.img_src
+            title = candidate.title
+            cand_context = f"{title} {cand_url} {candidate.url}"
+
+            # Cheap metadata checks first: no download/OCR for obvious rejects
+            if any(h in f"{cand_url} {candidate.url}".lower() for h in MOCKUP_HOSTS):
+                return "reject"   # design mockups / renders, not real product photos
+            cand_multi = is_candidate_multipack(title, cand_context, resolution=candidate.resolution)
+            if cand_multi != query_is_combo:
+                return "reject"
+            if is_back_panel_or_nutrition(title, cand_url):
+                return "reject"
+            if has_variant_conflict(title, [], product_name, brand):
+                return "reject"
+            meta_ok = is_dynamic_brand_match(cand_context, brand) and \
+                verify_product_keyword_match([], title, product_name, brand, cand_context)
+            meta_ok_map[cand_url] = meta_ok
+
+            # Stage 1: fast OCR on the full packaging image (thumbnail only if it can't be downloaded)
+            first = await read_image(client, cand_url, candidate.thumbnail_src, "fast")
+            clean_shots[cand_url] = is_clean_packshot(cand_url, first["quality"])
+            return judge(candidate, first, meta_ok)
+
+        confirmed: Dict[int, str] = {}
+
+        async def confirm(i: int) -> str:
+            """
+            Stage 2: strict OCR (more accurate model) must agree before an image is accepted.
+            Text either model read counts as evidence (size, brand); any rule the strict read breaks rejects.
+            Run only for the image about to be picked, so most searches need one strict OCR.
+            """
+            if i in confirmed:
+                return confirmed[i]
+            candidate = candidate_items[i]
+            verdict = verdicts[i]
+            second = await read_image(client, candidate.img_src, candidate.thumbnail_src, "strict")
+            if second["words"]:
+                strict_verdict = judge(candidate, second, meta_ok_map.get(candidate.img_src, False))
+                if strict_verdict == "reject":
+                    verdict = "reject"
+                elif verdict == "fallback" and strict_verdict == "exact":
+                    verdict = "exact"
+            confirmed[i] = verdicts[i] = verdict
+            return verdict
+
+        # Step 2: Inspection in rank order. The top-ranked image is screened alone first (it is usually
+        # right); after that OCR_BATCH candidates are screened in parallel. The first screened exact
+        # match is confirmed by the strict OCR; if it fails there, the next one is tried.
         verdicts: Dict[int, str] = {}
+        clean_shots: Dict[str, bool] = {}
+        selected_index = -1
+        match = "exact"
         start = 0
-        while start < len(candidate_items):
+        while start < len(candidate_items) and selected_index == -1:
             size = 1 if start == 0 else OCR_BATCH
             batch = list(range(start, min(start + size, len(candidate_items))))
-            results = await asyncio.gather(*(inspect(candidate_items[i]) for i in batch))
+            results = await asyncio.gather(*(screen(candidate_items[i]) for i in batch))
             verdicts.update(zip(batch, results))
-            if "exact" in results:
-                break
+            for i in batch:
+                if verdicts[i] == "exact" and await confirm(i) == "exact":
+                    selected_index = i
+                    break
             start += size
 
-        def first(kind: str) -> int:
-            return next((i for i in sorted(verdicts) if verdicts[i] == kind), -1)
-
-        selected_index = first("exact")
         if selected_index == -1:
-            selected_index = first("fallback")
+            # No exact match: best fallback in rank order, still confirmed by the strict OCR
+            for i in sorted(verdicts):
+                if verdicts[i] == "fallback":
+                    v = await confirm(i)
+                    if v != "reject":
+                        selected_index, match = i, v
+                        break
 
-        # Alternatives never include rejected images (back panels, wrong products)
+        # Alternatives never include rejected images (back panels, multi-packs, wrong products)
         rank = {"exact": 0, "fallback": 1}
         alt_order = sorted(
             (i for i in range(len(candidate_items)) if i != selected_index and verdicts.get(i) != "reject"),
@@ -1141,6 +1472,8 @@ async def _search_uncached(
             "status": "SUCCESS",
             "best_image": candidate_items[selected_index],
             "alternatives": alternatives,
+            "match": match,
+            "clean": clean_shots.get(candidate_items[selected_index].img_src, False),
             "error_message": None
         }
 
