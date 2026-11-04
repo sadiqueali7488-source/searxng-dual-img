@@ -38,3 +38,8 @@ Thumbs.db
 # Temporary dump files
 current_jPHV.json
 
+
+# Runtime cache & logs
+backend/cache/
+backend/server.log*
+frontend/vite.log

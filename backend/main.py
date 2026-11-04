@@ -28,6 +28,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def warm_ocr_engines():
+    # Load all OCR engines in the background so the first rows of a job are not slow
+    try:
+        import ocr_engine
+        ocr_engine.warmup()
+    except Exception:
+        pass
+
 @app.get("/api/health")
 async def health_check():
     searxng_status = await test_searxng_connection("http://localhost:8888")
