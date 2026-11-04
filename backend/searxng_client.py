@@ -127,44 +127,55 @@ def has_any_size_callout(words: List[str], title: str = "", url: str = "") -> bo
     return False
 
 def verify_size_strict(words: List[str], title: str, variant_label: str, url: str = "") -> bool:
-    """Strictly checks if candidate contains EXACT variant size and no conflicting printed weight."""
+    """
+    Universal size verifier supporting:
+    1. FMCG Weights/Volumes: 1kg, 500g, 200ml, 143g, 1L, etc.
+    2. Counts: 16 pcs, 4 finger, 12 bars, pack of 2
+    3. Apparel Sizes: XS, S, M, L, XL, XXL, Free Size
+    """
     if not variant_label:
         return False
-    m = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr|lb)?', variant_label.lower())
-    if not m:
-        return False
-    num = m.group(1)
-    unit = m.group(2) or ""
+    v_clean = variant_label.strip().lower()
+    full_text = (" ".join(words) + " " + title + " " + url).lower()
+    clean = re.sub(r'[^a-z0-9]', '', full_text)
 
-    full_text = " ".join(words) + " " + title + " " + url
-    clean = re.sub(r'[^a-z0-9]', '', full_text.lower())
+    # 1. Standard FMCG Weight/Volume/Count: e.g. 1kg, 500g, 200ml, 143g, 16 pcs
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr|lb|oz|pcs|pieces)?', v_clean)
+    if m and m.group(1):
+        num = m.group(1)
+        unit = m.group(2) or ""
+        targets = [
+            f"{num}{unit}", f"{num}gm", f"{num}gms", f"{num}g",
+            f"{num}kg", f"{num}ml", f"{num}l", f"{num}ltr", f"{num}lb",
+            f"{num}pcs", f"{num}pieces", f"{num}oz"
+        ]
+        has_target = any(t in clean for t in targets)
+        if not has_target:
+            return False
 
-    targets = [
-        f"{num}{unit}",
-        f"{num}gm",
-        f"{num}gms",
-        f"{num}g",
-        f"{num}kg",
-        f"{num}ml",
-        f"{num}l",
-        f"{num}ltr",
-        f"{num}lb"
-    ]
-    has_target = any(t in clean for t in targets)
-    if not has_target:
-        return False
+        # Check if OCR words on the packet clearly show a conflicting weight
+        if words and len(words) >= 2:
+            ocr_str = " ".join(words).lower()
+            other_sizes = re.findall(r'\b(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr)\b', ocr_str)
+            target_unit_norm = 'g' if unit in ['g', 'gm', 'gms'] else ('l' if unit in ['l', 'ltr', 'litre', 'liter'] else unit)
+            for o_num, o_unit in other_sizes:
+                o_unit_norm = 'g' if o_unit in ['g', 'gm', 'gms'] else ('l' if o_unit in ['l', 'ltr', 'litre', 'liter'] else o_unit)
+                if o_num != num and o_unit_norm == target_unit_norm:
+                    return False
+        return True
 
-    # Check if OCR words on the packet clearly show a conflicting weight
-    if words and len(words) >= 2:
-        ocr_str = " ".join(words).lower()
-        other_sizes = re.findall(r'\b(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr)\b', ocr_str)
-        target_unit_norm = 'g' if unit in ['g', 'gm', 'gms'] else ('l' if unit in ['l', 'ltr', 'litre', 'liter'] else unit)
-        for o_num, o_unit in other_sizes:
-            o_unit_norm = 'g' if o_unit in ['g', 'gm', 'gms'] else ('l' if o_unit in ['l', 'ltr', 'litre', 'liter'] else o_unit)
-            if o_num != num and o_unit_norm == target_unit_norm:
-                return False
+    # 2. Apparel / Clothing Sizes: e.g. S, M, L, XL, XXL, Free Size
+    apparel_sizes = {'xs', 's', 'm', 'l', 'xl', 'xxl', 'xxxl', 'free size', 'freesize'}
+    clean_v = re.sub(r'[^a-z0-9]', '', v_clean)
+    if clean_v in apparel_sizes or v_clean in apparel_sizes:
+        patterns = [
+            rf'\bsize\s*{re.escape(v_clean)}\b',
+            rf'\b{re.escape(v_clean)}\s*size\b',
+            rf'\b{re.escape(v_clean)}\b'
+        ]
+        return any(re.search(p, full_text) for p in patterns) or clean_v in clean
 
-    return True
+    return clean_v in clean
 
 COMPETITOR_BRANDS = [
     'rajbhog', 'narayani', 'patanjali', 'fortune', 'saffola', 'catch', 'everest',
@@ -256,14 +267,49 @@ def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") 
     full_context = f"{title} {url}"
     return is_dynamic_brand_match(full_context, brand, words)
 
-def verify_product_keyword_match(words: List[str], title: str, product_name: str, url: str = "") -> bool:
-    """Ensures core product nouns and all distinct sub-types match. Aadha-adhura information REJECT!"""
+def verify_product_keyword_match(words: List[str], title: str, product_name: str, brand: str = "", url: str = "") -> bool:
+    """Ensures core product nouns and distinct sub-types match for ANY category (Chocolates, Apparel, FMCG, Groceries)."""
     if not product_name:
         return True
     full_text = (" ".join(words) + " " + title + " " + url).lower()
     p_lower = product_name.lower()
+    b_lower = (brand or "").lower()
 
-    # 1. MILLET SPECIES LOCK:
+    # 1. UNIVERSAL PRODUCT TOKEN MATCHING:
+    # Extracts clean product tokens (excluding brand words, stop words, and unit tokens)
+    b_tokens = set(re.split(r'[\s\-_]+', b_lower))
+    raw_p_tokens = re.split(r'[\s\-_,()]+', p_lower)
+    
+    stop_words = {
+        'the', 'and', 'for', 'with', 'in', 'of', 'at', 'by', 'from', 'to', 'a', 'an',
+        'pure', 'original', 'best', 'organic', 'grade', 'premium', 'new', 'pack', 
+        'pouch', 'packet', 'box', 'bottle', 'piece', 'pieces', 'pcs', 'product', 
+        'item', 'quality', 'genuine', 'online'
+    }
+    prod_tokens = []
+    for t in raw_p_tokens:
+        t_clean = t.strip()
+        if len(t_clean) < 3 or t_clean in b_tokens or t_clean in stop_words:
+            continue
+        if re.match(r'^\d+(?:kg|g|gm|ml|l|ltr|pcs|piece|oz|lb)?$', t_clean):
+            continue
+        prod_tokens.append(t_clean)
+
+    if prod_tokens:
+        clean_comb_str = re.sub(r'[^a-z0-9]', '', full_text)
+        matched = 0
+        for pt in prod_tokens:
+            if re.search(rf'\b{re.escape(pt)}\b', full_text) or pt in clean_comb_str:
+                matched += 1
+        match_ratio = matched / len(prod_tokens)
+        if len(prod_tokens) <= 2:
+            if match_ratio < 1.0:
+                return False
+        else:
+            if match_ratio < 0.65:
+                return False
+
+    # 2. MILLET SPECIES LOCK:
     millet_species = {
         'foxtail': ['foxtail', 'kangni'],
         'bajra': ['bajra', 'pearl millet', 'pearlmillet'],
@@ -620,7 +666,7 @@ async def search_searxng_image(
             # Fast metadata pre-check
             if not is_dynamic_brand_match(cand_context, brand):
                 continue
-            if not verify_product_keyword_match([], title, product_name, cand_context):
+            if not verify_product_keyword_match([], title, product_name, brand, cand_context):
                 continue
 
             # Run OCR on packaging image
@@ -634,7 +680,7 @@ async def search_searxng_image(
             # Re-verify brand and category with OCR text
             if not is_dynamic_brand_match(cand_context, brand, words):
                 continue
-            if not verify_product_keyword_match(words, title, product_name, cand_context):
+            if not verify_product_keyword_match(words, title, product_name, brand, cand_context):
                 continue
 
             if is_variant and variant_label:
@@ -660,7 +706,7 @@ async def search_searxng_image(
 
                 words = ocr_cache.get(candidate.thumbnail_src or candidate.img_src, [])
                 if is_dynamic_brand_match(cand_context, brand, words) and \
-                   verify_product_keyword_match(words, candidate.title, product_name, cand_context):
+                   verify_product_keyword_match(words, candidate.title, product_name, brand, cand_context):
                     selected_index = idx
                     break
 

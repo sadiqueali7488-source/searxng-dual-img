@@ -393,7 +393,11 @@ class JobManager:
 
             is_combo = is_query_multipack(prod_name, variant)
 
-            # Query 1: Product Image (WITHOUT SIZE) -> brand + clean_p_name + front packaging pouch
+            # Detect category type for smart search suffixes (Apparel / Toys vs FMCG Packaged Goods)
+            apparel_keywords = {'top', 't-shirt', 'tshirt', 'shirt', 'jeans', 'trousers', 'pants', 'dress', 'kurti', 'kurta', 'saree', 'skirt', 'jacket', 'hoodie', 'shoes', 'sandals', 'sneakers', 'shorts', 'crop top', 'toy', 'toys', 'game'}
+            is_apparel_or_goods = any(re.search(rf'\b{re.escape(k)}\b', prod_name.lower()) for k in apparel_keywords)
+
+            # Query 1: Product Image (WITHOUT SIZE)
             p_parts = []
             if config.query_prefix:
                 p_parts.append(config.query_prefix.strip())
@@ -404,10 +408,13 @@ class JobManager:
             if config.query_suffix:
                 p_parts.append(config.query_suffix.strip())
             else:
-                p_parts.append("single pack front packaging" if not is_combo else "front packaging pouch")
+                if is_apparel_or_goods:
+                    p_parts.append("front view product shot")
+                else:
+                    p_parts.append("single pack front packaging" if not is_combo else "front packaging pouch")
             product_query = sanitize_search_query(" ".join(p_parts).strip() or clean_p_name or brand or "product")
 
-            # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label + single/combo pack front packaging
+            # Query 2: Variant Image (WITH SIZE)
             v_parts = []
             if config.query_prefix:
                 v_parts.append(config.query_prefix.strip())
@@ -420,7 +427,10 @@ class JobManager:
             if config.query_suffix:
                 v_parts.append(config.query_suffix.strip())
             else:
-                v_parts.append("combo pack front packaging" if is_combo else "single pack front packaging")
+                if is_apparel_or_goods:
+                    v_parts.append("front view product shot")
+                else:
+                    v_parts.append("combo pack front packaging" if is_combo else "single pack front packaging")
             variant_query = sanitize_search_query(" ".join(v_parts).strip() or product_query)
 
             job.row_results.append(RowResult(
