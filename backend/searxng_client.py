@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import io
+import json
 import logging
 import re
 import time
@@ -19,8 +21,47 @@ except Exception as e:
     logger.warning(f"PP-OCRv6 Medium failed to initialize: {e}")
     run_ocr = None
 
-# In-memory OCR cache: url -> list of lowercase text words
-ocr_cache: Dict[str, List[str]] = {}
+# OCR text and search results are cached on disk (cache_store) so nothing is done twice
+import cache_store
+
+# Images OCR'd at the same time per search (the OCR pool runs them in parallel)
+OCR_BATCH = 4
+MAX_ALTERNATIVES = 8
+
+# Image CDNs often block non-browser clients; without this many downloads (and so OCR) fail.
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+# Never use images from these hosts: social-media crawler proxies (e.g. lookaside.fbsbx.com/lookaside/crawler/...),
+# expiring CDN links, and stock/aggregator sites. Matched against the image URL and the page URL host.
+BLOCKED_IMAGE_DOMAINS = [
+    'jiomart',
+    'fbsbx.com', 'lookaside', 'fbcdn.net', 'facebook.com', 'fb.com', 'instagram.com', 'cdninstagram.com',
+    'whatsapp', 'threads.net', 'pinimg.com', 'pinterest', 'twimg.com', 'twitter.com', 'x.com',
+    'ytimg.com', 'youtube.com', 'tiktok', 'redd.it', 'reddit.com', 'licdn.com', 'linkedin.com',
+    'snapchat', 'sharechat', 'telegram',
+    'alamy', 'shutterstock', 'dreamstime', 'freepik', 'vecteezy', 'istockphoto', 'gettyimages', '123rf',
+]
+
+def _host(url: str) -> str:
+    m = re.match(r'^(?:https?:)?//([^/?#]+)', (url or "").strip().lower())
+    return m.group(1) if m else ""
+
+def is_blocked_source(img_url: str = "", page_url: str = "") -> bool:
+    """True for images hosted on, or found via, a blocked domain."""
+    full = (img_url or "").lower()
+    if '/lookaside/' in full or '/crawler/' in full:
+        return True
+    for host in (_host(img_url), _host(page_url)):
+        if not host:
+            continue
+        for b in BLOCKED_IMAGE_DOMAINS:
+            # 'fbsbx.com' matches lookaside.fbsbx.com but 'x.com' must not match box.com
+            if ('.' in b and (host == b or host.endswith('.' + b))) or ('.' not in b and b in host):
+                return True
+    return False
 
 def normalize_url(url: Optional[str]) -> str:
     if not url:
@@ -39,29 +80,59 @@ def sanitize_search_query(text: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 2.0) -> List[str]:
+async def _download_image(client: httpx.AsyncClient, url: str, timeout: float) -> Optional[bytes]:
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        resp = await client.get(url, timeout=timeout, headers=BROWSER_HEADERS, follow_redirects=True)
+        if resp.status_code != 200 or len(resp.content) < 800:
+            return None
+        if "html" in resp.headers.get("content-type", ""):
+            return None
+        return resp.content
+    except Exception:
+        return None
+
+async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, fallback_url: str = "", timeout: float = 6.0) -> List[str]:
     """
-    Downloads image and runs PP-OCRv6 Medium to read text printed on packaging.
-    Results are cached in memory.
+    Downloads the FULL image (falling back to the search thumbnail) and runs PP-OCRv6 Medium.
+    Small thumbnails hide nutrition tables / batch text, so back panels were slipping through.
+    Returns [] when the image could not be downloaded; failures are not cached (may be temporary).
     """
     if not img_url or run_ocr is None:
         return []
 
-    if img_url in ocr_cache:
-        return ocr_cache[img_url]
+    cached = cache_store.get_ocr(img_url)
+    if cached is not None:
+        return cached
+
+    content = await _download_image(client, img_url, timeout)
+    if content is None and fallback_url and fallback_url != img_url:
+        content = await _download_image(client, fallback_url, timeout)
+    if content is None:
+        return []
 
     try:
-        resp = await client.get(img_url, timeout=timeout)
-        if resp.status_code != 200 or len(resp.content) < 800:
-            ocr_cache[img_url] = []
-            return []
-
-        words = await run_ocr(resp.content)
-        ocr_cache[img_url] = words
-        return words
+        words = await run_ocr(content)
     except Exception:
-        ocr_cache[img_url] = []
         return []
+    cache_store.put_ocr(img_url, words)
+    return words
+
+def ocr_shows_front(words: List[str], brand: str = "", product_name: str = "") -> bool:
+    """
+    Front-of-pack evidence: OCR could read the image AND the brand or product name is printed on it.
+    An image we could not read, or one showing neither (side panel, plain back), is not accepted as a front.
+    """
+    if not words:
+        return False
+    ocr = " ".join(words).lower()
+    compact = re.sub(r'[^a-z0-9]', '', ocr)
+    if not brand and not product_name:
+        return True
+    tokens = [t for t in re.split(r'[\s\-_,()/&]+', f"{brand} {product_name}".lower())
+              if len(t) >= 4 and t not in GENERIC_BRAND_WORDS and not re.match(r'^\d', t)]
+    return any(t in compact for t in tokens) if tokens else True
 
 def is_query_multipack(query: str, variant_label: str = "") -> bool:
     """Detects if user query or variant specifies a multi-pack, combo, or bundle."""
@@ -154,10 +225,30 @@ def is_back_panel_or_nutrition(title: str = "", url: str = "", words: Optional[L
     if any(p in combined for p in direct_nutrition_phrases):
         return True
 
-    # 3. Macro nutrients cluster (Energy kcal / carbohydrate / protein / fat / fiber)
-    has_energy = 'energy' in combined or 'kcal' in combined
-    has_macros = any(m in combined for m in ['carbohydrate', 'protein', 'fat', 'sugar', 'fiber', 'fibre', 'cholesterol', 'sodium'])
-    if has_energy and has_macros:
+    # 3. Macro nutrients cluster (Energy kcal / carbohydrate / protein / fat / fiber).
+    # Indian front packs carry a small "per serve: energy, protein, sugar" badge, so one or two
+    # macros alone are not enough: require a real table (3+ macros) or a text-heavy image.
+    line_count = len(words or [])
+    has_energy = 'energy' in w_lower or 'kcal' in w_lower
+    macro_count = sum(1 for m in ['carbohydrate', 'protein', 'total fat', 'saturated', 'sugar', 'fiber', 'fibre', 'cholesterol', 'sodium']
+                      if m in w_lower)
+    if has_energy and (macro_count >= 3 or (macro_count >= 1 and line_count >= 25)):
+        return True
+    if ('energy' in t_lower or 'kcal' in t_lower) and any(m in t_lower for m in ['carbohydrate', 'protein', 'fat']):
+        return True
+
+    # 3.1 Text density: a front pack has a brand, a name and a few claims (~5-25 lines).
+    # Back panels and front+back composites (e.g. a 1000px image showing both sides) read 40+ lines.
+    if line_count >= 40:
+        return True
+
+    # 3.2 Contact / address block (only printed on the back)
+    contact_hits = sum(1 for p in [
+        r'@[a-z0-9-]+\.(?:com|in|co)', r'\b1800\s*\d{3}', r'toll\s*free', r'p\.?\s*o\.?\s*box', r'feedback',
+        r'complaint', r'\bpin\s*code\b', r'\b\d{3}\s?\d{3}\b.*\b(?:india|bengaluru|mumbai|delhi|kolkata|chennai)\b',
+        r'(?:batch|lot)\s*no', r'\bpkd\.?\b', r'\bmfd\.?\b', r'use\s*by', r'\bmrp\b.*incl', r'net\s*(?:weight|wt|qty|quantity)\s*[:.]'
+    ] if re.search(p, w_lower))
+    if contact_hits >= 2:
         return True
 
     # 4. Regulatory & Manufacturer Back-panel Cluster
@@ -297,6 +388,32 @@ def verify_size_strict(words: List[str], title: str, variant_label: str, url: st
         return any(re.search(p, full_text) for p in patterns) or clean_v in clean
 
     return clean_v in clean
+
+_UNIT_TO_BASE = {
+    'kg': ('mass', 1000), 'kgs': ('mass', 1000), 'g': ('mass', 1), 'gm': ('mass', 1), 'gms': ('mass', 1),
+    'gram': ('mass', 1), 'grams': ('mass', 1), 'l': ('vol', 1000), 'ltr': ('vol', 1000), 'litre': ('vol', 1000),
+    'liter': ('vol', 1000), 'ml': ('vol', 1),
+}
+_SIZE_RE = re.compile(r'(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(kgs?|grams?|gms?|gm|g|ltr|litre|liter|l|ml)(?![a-z])')
+
+def _parse_sizes(text: str) -> set:
+    """'1 Kg' -> {('mass', 1000.0)}; '500 ml' -> {('vol', 500.0)}."""
+    out = set()
+    for num, unit in _SIZE_RE.findall((text or "").lower()):
+        dim, factor = _UNIT_TO_BASE[unit]
+        out.add((dim, round(float(num) * factor, 1)))
+    return out
+
+def _ocr_shows_other_size(words: List[str], variant_label: str) -> bool:
+    """True when the pack itself shows a weight/volume, but none equals the requested one (500g pack for 1kg)."""
+    targets = _parse_sizes(variant_label)
+    if not targets:
+        return False
+    dims = {d for d, _ in targets}
+    # "per serve (30 g)" / "per 100 g" badges are not the pack size
+    ocr = re.sub(r'per\s*(?:serve|serving|100)\s*\(?\s*\d*(?:\.\d+)?\s*(?:g|gm|ml)?\s*\)?', ' ', " ".join(words or []).lower())
+    found = {s for s in _parse_sizes(ocr) if s[0] in dims}
+    return bool(found) and not (found & targets)
 
 COMPETITOR_BRANDS = [
     'rajbhog', 'narayani', 'patanjali', 'fortune', 'saffola', 'catch', 'everest',
@@ -592,9 +709,8 @@ def score_and_rank_images(
         page_url = (item.get("url") or "").lower()
         combined = f"{title} {img_url} {page_url}"
 
-        # 0. STRICT BLOCKED DOMAINS (e.g. JioMart)
-        blocked_domains = ['jiomart', 'jiomart.com']
-        if any(b in combined for b in blocked_domains):
+        # 0. STRICT BLOCKED DOMAINS (JioMart, Facebook/Instagram crawler links, Pinterest, stock sites...)
+        if is_blocked_source(img_url, page_url) or is_blocked_source(item.get("thumbnail_src") or ""):
             continue
 
         # 1. STRICT COMPETITOR BRAND FILTER
@@ -753,7 +869,69 @@ async def test_searxng_connection(base_url: str = "http://localhost:8888") -> Di
             "message": f"Connection error: {str(e)}"
         }
 
+_inflight: Dict[str, "asyncio.Future"] = {}
+
+def _result_to_cache(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **result,
+        "best_image": result["best_image"].model_dump() if result.get("best_image") else None,
+        "alternatives": [a.model_dump() for a in result.get("alternatives", [])],
+    }
+
+def _result_from_cache(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **data,
+        "best_image": ImageResult(**data["best_image"]) if data.get("best_image") else None,
+        "alternatives": [ImageResult(**a) for a in data.get("alternatives", [])],
+    }
+
 async def search_searxng_image(
+    client: httpx.AsyncClient,
+    base_url: str,
+    query: str,
+    brand: str = "",
+    product_name: str = "",
+    variant_label: str = "",
+    is_variant: bool = False,
+    safesearch: int = 0,
+    time_range: str = "",
+    language: str = "auto",
+    top_limit: int = 20
+) -> Dict[str, Any]:
+    """
+    Cached entry point:
+    - A SUCCESS result is stored on disk, so the same search (another size of the same product,
+      a re-run of the file, a server restart) is answered instantly.
+    - Identical searches running at the same moment share one search + OCR pass.
+    - NOT_FOUND / ERROR are not cached, so "Retry Not Found" really searches again.
+    """
+    clean_q = sanitize_search_query(query)
+    # The product image (without size) is the same for every size of a product: leave size out of its key
+    size_key = variant_label if (is_variant or is_query_multipack(product_name, variant_label)) else ""
+    key = hashlib.sha1(json.dumps(
+        [base_url.rstrip("/"), clean_q, brand, product_name, size_key, is_variant, safesearch, time_range, language, top_limit]
+    ).encode()).hexdigest()
+
+    cached = cache_store.get_search(key)
+    if cached is not None:
+        return _result_from_cache(cached)
+
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.ensure_future(_search_uncached(
+            client, base_url, query, brand, product_name, variant_label,
+            is_variant, safesearch, time_range, language, top_limit
+        ))
+        _inflight[key] = task
+        task.add_done_callback(lambda _t: _inflight.pop(key, None))
+    result = await asyncio.shield(task)
+
+    if result["status"] == "SUCCESS" and result.get("best_image"):
+        cache_store.put_search(key, _result_to_cache(result))
+    # Each row cycles through its own alternatives list
+    return {**result, "alternatives": list(result.get("alternatives", []))}
+
+async def _search_uncached(
     client: httpx.AsyncClient,
     base_url: str,
     query: str,
@@ -846,11 +1024,12 @@ async def search_searxng_image(
             resolution = item.get("resolution") or ""
             engine = item.get("engine") or ""
 
-            direct_img = img_src or thumbnail_src or page_url
-            thumb = thumbnail_src or img_src or direct_img
+            # A page URL is not an image: only real image links are candidates
+            direct_img = img_src or thumbnail_src
+            thumb = thumbnail_src or img_src
 
             if direct_img:
-                if any(b in direct_img.lower() or b in page_url.lower() for b in ['jiomart']):
+                if is_blocked_source(direct_img, page_url):
                     continue
 
                 candidate_items.append(ImageResult(
@@ -871,95 +1050,91 @@ async def search_searxng_image(
             }
 
         query_is_combo = is_query_multipack(product_name, variant_label)
-        selected_index = -1
 
-        # Step 2: Strict Vision / PaddleOCR Inspection
-        for idx, candidate in enumerate(candidate_items[:15]):
+        async def inspect(candidate: ImageResult) -> str:
+            """
+            'exact'    -> passes the strict rules (exact size / clean packshot)
+            'fallback' -> right brand + product front, but strict size/clean rule not met
+            'reject'   -> wrong product, back panel, multi-pack, unreadable, or other size
+            """
             cand_url = candidate.img_src
-            page_url = candidate.url
             title = candidate.title
-            cand_context = f"{title} {cand_url} {page_url}"
+            cand_context = f"{title} {cand_url} {candidate.url}"
 
-            # Multi-pack check (with aspect ratio & A+ banner protection)
+            # Cheap metadata checks first: no download/OCR for obvious rejects
             cand_multi = is_candidate_multipack(title, cand_context, resolution=candidate.resolution)
-            if not query_is_combo and cand_multi:
-                continue
-            if query_is_combo and not cand_multi:
-                continue
-
-            # Back panel & nutrition label guard (Front packaging only!)
+            if cand_multi != query_is_combo:
+                return "reject"
             if is_back_panel_or_nutrition(title, cand_url):
-                continue
+                return "reject"
+            meta_ok = is_dynamic_brand_match(cand_context, brand) and \
+                verify_product_keyword_match([], title, product_name, brand, cand_context)
 
-            # Fast metadata pre-check
-            if not is_dynamic_brand_match(cand_context, brand):
-                continue
-            if not verify_product_keyword_match([], title, product_name, brand, cand_context):
-                continue
+            # Run OCR on the full packaging image (thumbnail only if the full image can't be downloaded)
+            words = await extract_image_ocr_text(client, cand_url, candidate.thumbnail_src)
 
-            # Run OCR on packaging image
-            img_to_ocr = candidate.thumbnail_src or candidate.img_src
-            words = await extract_image_ocr_text(client, img_to_ocr, timeout=1.5)
-
-            # Re-verify back panel with OCR words
+            # FRONT-ONLY RULE: the image must be readable, must not be a back panel,
+            # and must show the brand or product name printed on it
             if is_back_panel_or_nutrition(title, cand_url, words):
-                continue
+                return "reject"
+            if not ocr_shows_front(words, brand, product_name):
+                return "reject"
 
-            # Re-verify multi-pack with OCR text & resolution
+            # Re-verify multi-pack, brand and category with OCR text
             if not query_is_combo and is_candidate_multipack(title, cand_context, words, resolution=candidate.resolution):
-                continue
-
-            # Re-verify brand and category with OCR text
+                return "reject"
             if not is_dynamic_brand_match(cand_context, brand, words):
-                continue
+                return "reject"
             if not verify_product_keyword_match(words, title, product_name, brand, cand_context):
-                continue
+                return "reject"
 
             if is_variant and variant_label:
                 # WITH SIZE: Must contain exact variant size on pack / title / url
-                has_exact = verify_size_strict(words, title, variant_label, cand_context)
-                if has_exact:
-                    selected_index = idx
-                    break
-            else:
-                # WITHOUT SIZE: Must NOT contain size callout (1kg, 500g, etc.)!
-                has_size = has_any_size_callout(words, title, cand_url)
-                if not has_size:
-                    selected_index = idx
-                    break
+                if meta_ok and verify_size_strict(words, title, variant_label, cand_context):
+                    return "exact"
+                return "reject" if _ocr_shows_other_size(words, variant_label) else "fallback"
+            # WITHOUT SIZE: prefer a pack without a size callout (1kg, 500g, etc.)
+            if meta_ok and not has_any_size_callout(words, title, cand_url):
+                return "exact"
+            return "fallback"
 
-        # Fallback: if strict size match wasn't met, search for any candidate with matching brand & product & combo consistency
+        # Step 2: Strict Vision / PP-OCRv6 Inspection, OCR_BATCH candidates at a time in rank order.
+        # Stops at the first batch containing an exact match, so most searches OCR only 4-8 images.
+        verdicts: Dict[int, str] = {}
+        for start in range(0, len(candidate_items), OCR_BATCH):
+            batch = list(range(start, min(start + OCR_BATCH, len(candidate_items))))
+            results = await asyncio.gather(*(inspect(candidate_items[i]) for i in batch))
+            verdicts.update(zip(batch, results))
+            if "exact" in results:
+                break
+
+        def first(kind: str) -> int:
+            return next((i for i in sorted(verdicts) if verdicts[i] == kind), -1)
+
+        selected_index = first("exact")
         if selected_index == -1:
-            for idx, candidate in enumerate(candidate_items):
-                cand_context = f"{candidate.title} {candidate.img_src} {candidate.url}"
-                cand_multi = is_candidate_multipack(candidate.title, cand_context, resolution=candidate.resolution)
-                if not query_is_combo and cand_multi:
-                    continue
+            selected_index = first("fallback")
 
-                words = ocr_cache.get(candidate.thumbnail_src or candidate.img_src, [])
-                if is_back_panel_or_nutrition(candidate.title, candidate.img_src, words):
-                    continue
-
-                if is_dynamic_brand_match(cand_context, brand, words) and \
-                   verify_product_keyword_match(words, candidate.title, product_name, brand, cand_context):
-                    selected_index = idx
-                    break
+        # Alternatives never include rejected images (back panels, wrong products)
+        rank = {"exact": 0, "fallback": 1}
+        alt_order = sorted(
+            (i for i in range(len(candidate_items)) if i != selected_index and verdicts.get(i) != "reject"),
+            key=lambda i: (rank.get(verdicts.get(i, ""), 2), i)
+        )
+        alternatives = [candidate_items[i] for i in alt_order][:MAX_ALTERNATIVES]
 
         # If still no candidate matches both brand and product, return NOT_FOUND (Zero false positives!)
         if selected_index == -1:
             return {
                 "status": "NOT_FOUND",
                 "best_image": None,
-                "alternatives": candidate_items[:5],
+                "alternatives": alternatives,
                 "error_message": f"No verified image matching brand '{brand}' and product '{product_name}'"
             }
 
-        best_image = candidate_items[selected_index]
-        alternatives = [img for i, img in enumerate(candidate_items) if i != selected_index]
-
         return {
             "status": "SUCCESS",
-            "best_image": best_image,
+            "best_image": candidate_items[selected_index],
             "alternatives": alternatives,
             "error_message": None
         }

@@ -314,7 +314,10 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     setRows(prevRows => {
       const next = [...prevRows];
       for (const updatedRow of batch) {
-        const idx = next.findIndex(r => r.row_index === updatedRow.row_index);
+        // rows are stored in row_index order, so the index is a direct O(1) lookup
+        // (findIndex over 1 lakh rows for every update froze the page)
+        const i = updatedRow.row_index;
+        const idx = next[i]?.row_index === i ? i : next.findIndex(r => r.row_index === i);
         if (idx >= 0) {
           next[idx] = updatedRow;
         } else {
@@ -384,7 +387,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
           batchTimerRef.current = setTimeout(() => {
             batchTimerRef.current = null;
             flushRowBatch();
-          }, 60);
+          }, 250);
         }
       });
 

@@ -93,24 +93,17 @@ class SearchJob:
                 if col not in df.columns:
                     df[col] = ""
 
-            for idx in df.index:
-                p_name = df.at[idx, 'product_name'] if 'product_name' in df.columns else ""
-                if 'brand_name' in df.columns:
-                    df.at[idx, 'brand_name'] = clean_brand(df.at[idx, 'brand_name'], p_name)
-                if 'mrp' in df.columns:
-                    df.at[idx, 'mrp'] = clean_currency(df.at[idx, 'mrp'])
-                if 'sale_price' in df.columns:
-                    df.at[idx, 'sale_price'] = clean_currency(df.at[idx, 'sale_price'])
-                if 'variant_axes' in df.columns:
-                    df.at[idx, 'variant_axes'] = clean_axes(df.at[idx, 'variant_axes'])
-                if 'product_attributes' in df.columns:
-                    df.at[idx, 'product_attributes'] = clean_attributes(df.at[idx, 'product_attributes'])
-                if 'variant_attributes' in df.columns:
-                    df.at[idx, 'variant_attributes'] = clean_attributes(df.at[idx, 'variant_attributes'])
-                if 'product_images' in df.columns:
-                    df.at[idx, 'product_images'] = ""
-                if 'variant_images' in df.columns:
-                    df.at[idx, 'variant_images'] = ""
+            # Column-wise cleaning (row-by-row df.at is far too slow for 1 lakh rows)
+            p_names = df['product_name'].tolist() if 'product_name' in df.columns else [""] * len(df)
+            if 'brand_name' in df.columns:
+                df['brand_name'] = [clean_brand(b, p) for b, p in zip(df['brand_name'].tolist(), p_names)]
+            for col, fn in (('mrp', clean_currency), ('sale_price', clean_currency), ('variant_axes', clean_axes),
+                            ('product_attributes', clean_attributes), ('variant_attributes', clean_attributes)):
+                if col in df.columns:
+                    df[col] = df[col].map(fn)
+            for col in ('product_images', 'variant_images'):
+                if col in df.columns:
+                    df[col] = ""
 
             ordered_cols = [c for c in PRODUCT_MASTER_30_COLUMNS if c in df.columns]
             extra_cols = [c for c in df.columns if c not in PRODUCT_MASTER_30_COLUMNS]
@@ -351,8 +344,7 @@ class JobManager:
         job.status.progress_percent = 0.0
 
         job.row_results = []
-        for idx, (_, row) in enumerate(rows_to_process.iterrows()):
-            original_data = row.to_dict()
+        for idx, original_data in enumerate(rows_to_process.to_dict(orient="records")):
             clean_original_data = {
                 k: ("" if pd.isna(v) else str(v)) for k, v in original_data.items()
             }
@@ -449,43 +441,48 @@ class JobManager:
 
     async def _execute_job(self, job: SearchJob, specific_rows: Optional[List[RowResult]] = None):
         config = job.config
-        semaphore = asyncio.Semaphore(config.concurrency)
         job.start_time = time.time()
         timeout = httpx.Timeout(15.0, connect=5.0)
+        last_status_push = 0.0
 
-        limits = httpx.Limits(max_keepalive_connections=config.concurrency * 2, max_connections=config.concurrency * 3)
+        async def push_status():
+            # Throttled: with 1 lakh rows a status event per row floods the browser
+            nonlocal last_status_push
+            now = time.time()
+            if now - last_status_push >= 0.5:
+                last_status_push = now
+                await job.broadcast("status_update", job.status.model_dump())
+
+        # Each row runs two searches at once, each downloading up to 4 images in parallel
+        limits = httpx.Limits(max_keepalive_connections=config.concurrency * 4, max_connections=config.concurrency * 10)
         async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
             target_rows = specific_rows if specific_rows is not None else job.row_results
 
             async def process_single_row(row_res: RowResult):
                 if job.is_cancelled:
                     return
-
                 await job.pause_event.wait()
                 if job.is_cancelled:
                     return
 
-                async with semaphore:
-                    if job.is_cancelled:
-                        return
-                    await job.pause_event.wait()
+                row_res.status = "SEARCHING"
+                row_res.product_status = "SEARCHING"
+                row_res.variant_status = "SEARCHING"
+                job.status.current_query = f"{row_res.product_query} / {row_res.variant_query}"
+                await job.broadcast("row_update", row_res.model_dump())
 
-                    row_res.status = "SEARCHING"
-                    row_res.product_status = "SEARCHING"
-                    row_res.variant_status = "SEARCHING"
-                    job.status.current_query = f"{row_res.product_query} / {row_res.variant_query}"
-                    await job.broadcast("row_update", row_res.model_dump())
+                if config.delay_ms > 0:
+                    await asyncio.sleep(config.delay_ms / 1000.0)
 
-                    if config.delay_ms > 0:
-                        await asyncio.sleep(config.delay_ms / 1000.0)
+                orig_row = row_res.original_data or {}
+                b_val = orig_row.get("brand_name") or orig_row.get("brand") or orig_row.get("Brand") or orig_row.get("BRAND") or orig_row.get("Brand Name") or orig_row.get("Manufacturer") or ""
+                p_val = orig_row.get("product_name") or orig_row.get("Product Name") or orig_row.get("product") or orig_row.get("Product") or ""
+                v_val = orig_row.get("variant_label") or orig_row.get("variant") or orig_row.get("Variant") or orig_row.get("size") or orig_row.get("Size") or orig_row.get("pack_size") or orig_row.get("Pack Size") or orig_row.get("PACK SIZE") or orig_row.get("weight") or orig_row.get("Weight") or ""
 
-                    orig_row = row_res.original_data or {}
-                    b_val = orig_row.get("brand_name") or orig_row.get("brand") or orig_row.get("Brand") or orig_row.get("BRAND") or orig_row.get("Brand Name") or orig_row.get("Manufacturer") or ""
-                    p_val = orig_row.get("product_name") or orig_row.get("Product Name") or orig_row.get("product") or orig_row.get("Product") or ""
-                    v_val = orig_row.get("variant_label") or orig_row.get("variant") or orig_row.get("Variant") or orig_row.get("size") or orig_row.get("Size") or orig_row.get("pack_size") or orig_row.get("Pack Size") or orig_row.get("PACK SIZE") or orig_row.get("weight") or orig_row.get("Weight") or ""
-
-                    # 1. Search Product Image (Without Size)
-                    res_p = await search_searxng_image(
+                # 1. Product Image (Without Size) and 2. Variant Image (With Size):
+                # separate independent searches and inspections, run side by side
+                res_p, res_v = await asyncio.gather(
+                    search_searxng_image(
                         client=client,
                         base_url=config.searxng_url,
                         query=row_res.product_query,
@@ -496,19 +493,8 @@ class JobManager:
                         safesearch=config.safesearch,
                         time_range=config.time_range,
                         language=config.language
-                    )
-
-                    row_res.product_status = res_p["status"]
-                    if res_p["status"] == "SUCCESS" and res_p["best_image"]:
-                        best_p = res_p["best_image"]
-                        row_res.product_image_url = clean_image_link(best_p.img_src)
-                        row_res.product_thumbnail_url = clean_image_link(best_p.thumbnail_src) or row_res.product_image_url
-                        row_res.product_resolution = best_p.resolution
-                        row_res.product_engine = best_p.engine
-                        row_res.product_alternatives = res_p.get("alternatives", [])
-
-                    # 2. Search Variant Image (With Size) - Separate independent search and inspection
-                    res_v = await search_searxng_image(
+                    ),
+                    search_searxng_image(
                         client=client,
                         base_url=config.searxng_url,
                         query=row_res.variant_query,
@@ -520,41 +506,77 @@ class JobManager:
                         time_range=config.time_range,
                         language=config.language
                     )
-                    row_res.variant_status = res_v["status"]
-                    if res_v["status"] == "SUCCESS" and res_v["best_image"]:
-                        best_v = res_v["best_image"]
-                        row_res.variant_image_url = clean_image_link(best_v.img_src)
-                        row_res.variant_thumbnail_url = clean_image_link(best_v.thumbnail_src) or row_res.variant_image_url
-                        row_res.variant_resolution = best_v.resolution
-                        row_res.variant_engine = best_v.engine
-                        row_res.variant_alternatives = res_v.get("alternatives", [])
+                )
 
-                    # Determine overall status
-                    if row_res.product_image_url and row_res.variant_image_url:
-                        row_res.status = "SUCCESS"
-                        job.status.success_count += 1
-                    else:
-                        row_res.status = "NOT_FOUND"
-                        job.status.not_found_count += 1
+                row_res.product_status = res_p["status"]
+                if res_p["status"] == "SUCCESS" and res_p["best_image"]:
+                    best_p = res_p["best_image"]
+                    row_res.product_image_url = clean_image_link(best_p.img_src)
+                    row_res.product_thumbnail_url = clean_image_link(best_p.thumbnail_src) or row_res.product_image_url
+                    row_res.product_resolution = best_p.resolution
+                    row_res.product_engine = best_p.engine
+                    row_res.product_alternatives = res_p.get("alternatives", [])
 
-                    row_res.image_url = row_res.product_image_url or row_res.variant_image_url
-                    row_res.thumbnail_url = row_res.product_thumbnail_url or row_res.variant_thumbnail_url
+                row_res.variant_status = res_v["status"]
+                if res_v["status"] == "SUCCESS" and res_v["best_image"]:
+                    best_v = res_v["best_image"]
+                    row_res.variant_image_url = clean_image_link(best_v.img_src)
+                    row_res.variant_thumbnail_url = clean_image_link(best_v.thumbnail_src) or row_res.variant_image_url
+                    row_res.variant_resolution = best_v.resolution
+                    row_res.variant_engine = best_v.engine
+                    row_res.variant_alternatives = res_v.get("alternatives", [])
 
-                    job.status.processed_rows += 1
-                    elapsed = max(0.1, time.time() - job.start_time)
-                    job.status.elapsed_seconds = round(elapsed, 1)
-                    speed = job.status.processed_rows / elapsed
-                    job.status.speed_rows_per_sec = round(speed, 2)
-                    remaining = job.status.total_rows - job.status.processed_rows
-                    job.status.eta_seconds = round(remaining / speed, 1) if speed > 0 else 0
-                    job.status.progress_percent = round((job.status.processed_rows / job.status.total_rows) * 100, 1)
+                # Determine overall status
+                if row_res.product_image_url and row_res.variant_image_url:
+                    row_res.status = "SUCCESS"
+                    job.status.success_count += 1
+                elif "ERROR" in (res_p["status"], res_v["status"]):
+                    row_res.status = "ERROR"
+                    row_res.error_message = res_p.get("error_message") or res_v.get("error_message")
+                    job.status.error_count += 1
+                else:
+                    row_res.status = "NOT_FOUND"
+                    job.status.not_found_count += 1
 
-                    await job.broadcast("row_update", row_res.model_dump())
-                    await job.broadcast("status_update", job.status.model_dump())
+                row_res.image_url = row_res.product_image_url or row_res.variant_image_url
+                row_res.thumbnail_url = row_res.product_thumbnail_url or row_res.variant_thumbnail_url
 
-            tasks = [process_single_row(row) for row in target_rows]
+                job.status.processed_rows += 1
+                elapsed = max(0.1, time.time() - job.start_time)
+                job.status.elapsed_seconds = round(elapsed, 1)
+                speed = job.status.processed_rows / elapsed
+                job.status.speed_rows_per_sec = round(speed, 2)
+                remaining = job.status.total_rows - job.status.processed_rows
+                job.status.eta_seconds = round(remaining / speed, 1) if speed > 0 else 0
+                job.status.progress_percent = round((job.status.processed_rows / job.status.total_rows) * 100, 1)
+
+                await job.broadcast("row_update", row_res.model_dump())
+                await push_status()
+
+            # Fixed pool of workers pulling rows from a queue (not one task per row for 1 lakh rows)
+            queue: asyncio.Queue = asyncio.Queue()
+            for row in target_rows:
+                queue.put_nowait(row)
+
+            async def worker():
+                while not job.is_cancelled:
+                    try:
+                        row_res = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        await process_single_row(row_res)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        row_res.status = "ERROR"
+                        row_res.error_message = str(e)
+                        job.status.error_count += 1
+                        job.status.processed_rows += 1
+                        await job.broadcast("row_update", row_res.model_dump())
+
             try:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*(worker() for _ in range(config.concurrency)))
             except asyncio.CancelledError:
                 job.status.state = "cancelled"
             except Exception as e:
@@ -585,6 +607,17 @@ class JobManager:
         job.is_paused = False
         job.is_cancelled = False
         job.pause_event.set()
+
+        # Retried rows are counted again when they finish (keeps progress at or below 100%)
+        for r in failed_rows:
+            if r.status == "ERROR":
+                job.status.error_count = max(0, job.status.error_count - 1)
+            elif r.status == "NOT_FOUND":
+                job.status.not_found_count = max(0, job.status.not_found_count - 1)
+            elif r.status == "SUCCESS":
+                job.status.success_count = max(0, job.status.success_count - 1)
+            if r.status not in ("PENDING", "SEARCHING"):
+                job.status.processed_rows = max(0, job.status.processed_rows - 1)
 
         # Launch background retry task for failed rows
         job.task = asyncio.create_task(self._execute_job(job, specific_rows=failed_rows))
