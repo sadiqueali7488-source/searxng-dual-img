@@ -11,14 +11,13 @@ from models import ImageResult
 
 logger = logging.getLogger("searxng_client")
 
-# Initialize RapidOCR (PaddleOCR ONNX backend)
-ocr_engine = None
+# Initialize PP-OCRv6 Medium (PaddleOCR ONNX backend)
 try:
-    from rapidocr_onnxruntime import RapidOCR
-    ocr_engine = RapidOCR()
-    logger.info("RapidOCR (PaddleOCR ONNX backend) initialized successfully.")
+    from ocr_engine import run_ocr
+    logger.info("PP-OCRv6 Medium (PaddleOCR ONNX backend) initialized successfully.")
 except Exception as e:
-    logger.warning(f"PaddleOCR failed to initialize: {e}")
+    logger.warning(f"PP-OCRv6 Medium failed to initialize: {e}")
+    run_ocr = None
 
 # In-memory OCR cache: url -> list of lowercase text words
 ocr_cache: Dict[str, List[str]] = {}
@@ -37,12 +36,12 @@ def sanitize_search_query(text: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 1.5) -> List[str]:
+async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 2.0) -> List[str]:
     """
-    Downloads image and runs PaddleOCR to read text printed on packaging.
+    Downloads image and runs PP-OCRv6 Medium to read text printed on packaging.
     Results are cached in memory.
     """
-    if not ocr_engine or not img_url:
+    if not img_url or run_ocr is None:
         return []
 
     if img_url in ocr_cache:
@@ -54,19 +53,7 @@ async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeou
             ocr_cache[img_url] = []
             return []
 
-        def _do_ocr(content_bytes: bytes) -> List[str]:
-            try:
-                img = Image.open(io.BytesIO(content_bytes)).convert("RGB")
-                img.thumbnail((640, 640))
-                img_np = np.array(img)
-                res, _ = ocr_engine(img_np)
-                if not res:
-                    return []
-                return [text.lower().strip() for _, text, conf in res if conf >= 0.4]
-            except Exception:
-                return []
-
-        words = await asyncio.to_thread(_do_ocr, resp.content)
+        words = await run_ocr(resp.content)
         ocr_cache[img_url] = words
         return words
     except Exception:
@@ -218,6 +205,10 @@ def contains_conflicting_brand(text: str, target_brand: str) -> bool:
     clean_text = text.lower()
     t_tokens = set(re.split(r'[\s\-_]+', t_brand))
     
+    # Ignore corporate endorsement "tata enterprise" on BigBasket / bb packages
+    if any(b in t_brand for b in ['bb', 'bigbasket']):
+        clean_text = re.sub(r'\btata\s+enterprise[s]?\b', '', clean_text)
+
     for cb in COMPETITOR_BRANDS:
         cb_tokens = set(re.split(r'[\s\-_]+', cb))
         if cb_tokens.issubset(t_tokens) or t_tokens.issubset(cb_tokens):
