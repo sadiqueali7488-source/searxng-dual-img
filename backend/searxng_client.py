@@ -73,6 +73,49 @@ async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeou
         ocr_cache[img_url] = []
         return []
 
+def is_query_multipack(query: str, variant_label: str = "") -> bool:
+    """Detects if user query or variant specifies a multi-pack, combo, or bundle."""
+    text = (query + " " + variant_label).lower()
+    patterns = [
+        r'\bpack\s*of\s*[2-9]\b',
+        r'\bpack-[2-9]\b',
+        r'\b(?:combo|bundle|multipack|twin\s*pack|dual\s*pack|set\s*of\s*[2-9])\b',
+        r'\bbuy\s*[1-9]\s*get\s*[1-9]\b',
+        r'\bbogo\b',
+        r'\b\d+(?:\.\d+)?\s*(?:kg|g|gm|l|ml)\s*\+\s*\d+(?:\.\d+)?\s*(?:kg|g|gm|l|ml)\b',
+        r'\b[2-9]\s*x\s*\d+\s*(?:kg|g|gm|l|ml)\b'
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[str]] = None) -> bool:
+    """Detects if candidate image shows or describes a multi-pack / twin pack / combo."""
+    ocr_str = " ".join(words or []).lower()
+    combined = f"{title.lower()} {url.lower()} {ocr_str}"
+    
+    # 1. URL signatures
+    if re.search(r'pack[-_]?of[-_]?[2-9]', url.lower()) or 'pack-of-' in url.lower():
+        return True
+    if any(k in url.lower() for k in ['combo', 'bundle', 'twin-pack', 'twin_pack', 'multipack']):
+        return True
+
+    # 2. Text / OCR signatures
+    patterns = [
+        r'\bpack\s*of\s*[2-9]\b',
+        r'\b[2-9]\s*pack\b',
+        r'\btwin\s*pack\b',
+        r'\bcombo\s*pack\b',
+        r'\bcombo\b',
+        r'\bbundle\b',
+        r'\bset\s*of\s*[2-9]\b',
+        r'\bbuy\s*[1-9]\s*get\s*[1-9]\b',
+        r'\bbogo\b',
+        r'\b[2-9]\s*x\s*\d+\s*(?:kg|g|gm|l|ml)\b',
+        r'\b\d+(?:\.\d+)?\s*(?:kg|g|gm|l|ml)\s*\+\s*\d+(?:\.\d+)?\s*(?:kg|g|gm|l|ml)\b',
+        r'\bmultipack\b',
+        r'\bmulti-pack\b'
+    ]
+    return any(re.search(p, combined) for p in patterns)
+
 def has_any_size_callout(words: List[str], title: str = "", url: str = "") -> bool:
     """Checks if image text, title, or url mentions any package size (e.g. 1kg, 500g, 5kg)."""
     full_text = " ".join(words) + " " + title + " " + url
@@ -115,7 +158,7 @@ COMPETITOR_BRANDS = [
     'kashi', 'mahatma', 'shri hans', 'tata', 'aashirvaad', '24 mantra', 'amul',
     'britannia', 'parle', 'sunfeast', 'haldiram', 'bikaji', 'mtr', 'shakti bhog',
     'aachi', 'priya', 'suhana', 'badshah', 'ramdev', 'annapurna', 'bawarchi',
-    'sarveshwari', 'goldiee', 'goldie', 'suruchi', 'saras', 'devaiah'
+    'sarveshwari', 'goldiee', 'goldie', 'suruchi', 'saras', 'devaiah', '9am'
 ]
 
 def contains_conflicting_brand(text: str, target_brand: str) -> bool:
@@ -124,8 +167,11 @@ def contains_conflicting_brand(text: str, target_brand: str) -> bool:
         return False
     t_brand = target_brand.lower().strip()
     clean_text = text.lower()
+    t_tokens = set(re.split(r'[\s\-_]+', t_brand))
+    
     for cb in COMPETITOR_BRANDS:
-        if cb in t_brand or t_brand in cb:
+        cb_tokens = set(re.split(r'[\s\-_]+', cb))
+        if cb_tokens.issubset(t_tokens) or t_tokens.issubset(cb_tokens):
             continue
         if re.search(rf'\b{re.escape(cb)}\b', clean_text):
             return True
@@ -139,13 +185,10 @@ def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") 
     full_text = (" ".join(words) + " " + title + " " + url).lower()
 
     # 1. STRICT COMPETITOR BRAND CHECK:
-    # If the title, URL, or packaging text mentions ANY other competitor brand (like Rajbhog, Narayani, etc.),
-    # IMMEDIATELY REJECT IT!
     if contains_conflicting_brand(full_text, brand):
         return False
 
     # 2. IF OCR WORDS EXIST, VERIFY BRAND PRINTED ON PACKAGING:
-    # If OCR extracted readable text from the pack (words has >= 2 words), the target brand MUST be present on the packet!
     if words and len(words) >= 2:
         ocr_text = " ".join(words).lower()
         if 'aashirvaad' in brand_clean:
@@ -170,7 +213,7 @@ def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") 
             if not ('9am' in ocr_text or '9 am' in ocr_text):
                 return False
 
-    # 3. Specific brand keywords that uniquely identify the brand
+    # 3. Known brand keys
     known_brand_keys = {
         'tata': ['tata'],
         'tata sampann': ['sampann'],
@@ -199,7 +242,6 @@ def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") 
         'mother dairy': ['mother dairy'],
         'country delight': ['country delight'],
     }
-    
     for k, keys in known_brand_keys.items():
         if k in brand_clean:
             return any(key in full_text for key in keys)
@@ -216,8 +258,37 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
     full_text = (" ".join(words) + " " + title + " " + url).lower()
     p_lower = product_name.lower()
 
-    # 1. DISTINCTIVE FLAVOR / SUB-TYPE CHECK:
-    # If product name specifies a sub-type (like beetroot, methi, khapli, sattu, 7 grain):
+    # 1. MILLET SPECIES LOCK:
+    # Strictly isolate Foxtail, Bajra, Ragi, Jowar, Kodo, Little, Barnyard
+    millet_species = {
+        'foxtail': ['foxtail', 'kangni'],
+        'bajra': ['bajra', 'pearl millet', 'pearlmillet'],
+        'pearl': ['bajra', 'pearl millet', 'pearlmillet'],
+        'ragi': ['ragi', 'finger millet', 'fingermillet', 'mandua'],
+        'jowar': ['jowar', 'sorghum'],
+        'kodo': ['kodo', 'kodra'],
+        'little': ['little millet', 'kutki', 'sama'],
+        'barnyard': ['barnyard', 'sanwa', 'samak']
+    }
+    for spec, aliases in millet_species.items():
+        if spec in p_lower:
+            if not any(a in full_text for a in aliases):
+                return False
+            for other_spec, other_aliases in millet_species.items():
+                if other_spec == spec or other_spec in p_lower:
+                    continue
+                if any(re.search(rf'\b{re.escape(oa)}\b', full_text) for oa in other_aliases):
+                    return False
+
+    # 2. FORM LOCK: Flour / Atta vs Whole Grain
+    has_flour = any(f in p_lower for f in ['flour', 'atta', 'peeth', 'powder'])
+    if has_flour:
+        cand_has_flour = any(f in full_text for f in ['flour', 'atta', 'peeth', 'powder'])
+        # If image or text specifically states it is unhulled grain / pearled grain without flour:
+        if ('pearled' in full_text or 'parboiled' in full_text) and not cand_has_flour:
+            return False
+
+    # 3. DISTINCTIVE FLAVOR / SUB-TYPE CHECK:
     distinctive_subtypes = [
         'beetroot', 'methi', 'khapli', 'multigrain', '7 grain', '7grain', 'sharbati',
         'ragi', 'sooji', 'suji', 'maida', 'besan', 'sattu', 'cornflour', 'corn flour',
@@ -234,19 +305,16 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
             elif sub not in full_text:
                 return False
 
-    # 2. CORE CATEGORIES (e.g. sattu != dal, besan != atta)
-    core_categories = [
-        'sattu', 'besan', 'atta', 'maida', 'sooji', 'suji', 'rawa', 'flour', 
-        'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee', 'sugar', 'salt', 
-        'masala', 'cornflour', 'poha', 'dalia', 'noodles', 'pasta', 'biscuit',
-        'cookies', 'paneer', 'butter', 'cheese', 'pickle', 'sauce', 'ketchup'
-    ]
-    for cat in core_categories:
-        if re.search(rf'\b{cat}\b', p_lower):
-            if cat == 'sattu' and 'sattu' not in full_text:
-                return False
-            if cat in full_text:
-                return True
+    # 4. CORE CATEGORIES LOCK (e.g. sattu != dal, salt != atta, oil != ghee)
+    if 'sattu' in p_lower and 'sattu' not in full_text:
+        return False
+    if 'salt' in p_lower and any(c in full_text for c in ['atta', 'oil', 'flour']):
+        return False
+    if 'oil' in p_lower and any(c in full_text for c in ['salt', 'ghee', 'atta']):
+        return False
+    if 'ghee' in p_lower and 'oil' in full_text:
+        return False
+
     return True
 
 def score_and_rank_images(
@@ -256,7 +324,7 @@ def score_and_rank_images(
     variant_label: str = "",
     is_variant: bool = False
 ) -> List[Dict[str, Any]]:
-    """Scores candidate images by metadata relevance."""
+    """Scores candidate images by metadata relevance and strict brand/combo filters."""
     if not results:
         return []
 
@@ -266,6 +334,8 @@ def score_and_rank_images(
     stop_words = {'100', 'pure', 'pack', 'pouch', 'packet', 'the', 'and', 'for', 'with', 'original', 'best', 'organic', 'grade'}
     prod_clean = (product_name or "").strip().lower()
     prod_tokens = [t for t in re.split(r'[\s\-_]+', prod_clean) if len(t) >= 3 and t not in stop_words]
+
+    query_is_combo = is_query_multipack(product_name, variant_label)
 
     scored = []
     has_any_brand_match = False
@@ -281,9 +351,40 @@ def score_and_rank_images(
         if any(b in combined for b in blocked_domains):
             continue
 
+        # 1. STRICT COMPETITOR BRAND FILTER:
+        # If competitor brand is found, completely drop candidate!
+        if contains_conflicting_brand(combined, brand):
+            continue
+
+        # 2. MULTI-PACK VS SINGLE PACK FILTER:
+        cand_is_combo = is_candidate_multipack(title, f"{img_url} {page_url}")
+        if not query_is_combo and cand_is_combo:
+            # Query is SINGLE pack (500g, 1kg), candidate is multi-pack/combo -> REJECT!
+            continue
+
+        # 3. MILLET SPECIES CONFLICT FILTER:
+        if 'foxtail' in prod_clean:
+            if any(m in combined for m in ['bajra', 'pearl millet', 'ragi', 'jowar', 'kodo']):
+                continue
+        if 'bajra' in prod_clean and any(m in combined for m in ['foxtail', 'ragi', 'jowar']):
+            continue
+
+        # 4. DISTINCTIVE FLAVOR / SUB-TYPE FILTER:
+        if 'beetroot' in prod_clean and 'beetroot' not in combined:
+            continue
+        if 'sattu' in prod_clean and 'sattu' not in combined:
+            continue
+
         score = 0.0
 
-        # 1. STRICT BRAND MATCHING
+        # Combo preference
+        if query_is_combo:
+            if cand_is_combo:
+                score += 100.0
+            else:
+                score -= 50.0
+
+        # Brand matching
         brand_match_count = 0
         if brand_tokens:
             for bt in brand_tokens:
@@ -299,7 +400,7 @@ def score_and_rank_images(
             else:
                 score -= 80.0
 
-        # 2. CORE PRODUCT NAME KEYWORD MATCHING
+        # Product name keywords
         for pt in prod_tokens:
             if pt in brand_tokens:
                 continue
@@ -310,12 +411,8 @@ def score_and_rank_images(
                     score += 45.0
                 else:
                     score += 25.0
-            else:
-                # If a specific flavor/sub-type is completely missing from candidate, penalize heavily!
-                if pt in ['beetroot', 'methi', 'khapli', 'ragi', 'sharbati']:
-                    score -= 100.0
 
-        # 3. VARIANT SIZE METADATA CHECK
+        # Variant size metadata check
         if is_variant and variant_label:
             v_match = re.search(r'(\d+)\s*(kg|g|gm|ml|l|ltr)?', variant_label.lower())
             if v_match:
@@ -330,25 +427,29 @@ def score_and_rank_images(
                     rf'\b{num}kg\b'
                 ]
                 if any(re.search(p, combined) for p in patterns):
-                    score += 50.0
+                    score += 60.0
         elif not is_variant:
             # For Product Image (without size), penalize images that have size in title!
             if re.search(r'\b\d+(?:\.\d+)?\s*(kg|g|gm|ml|l|ltr|lb)\b', combined):
                 score -= 40.0
 
-        # 4. TRUSTED RETAILER BOOST
+        # Trusted retailer boost
         trusted = [
-            'amazon', 'flipkart', 'bigbasket', 'bbassets', 'blinkit', 'grofers', 
+            '24mantraorganic', 'aashirvaad', 'bigbasket', 'bbassets', 'blinkit', 'grofers', 
             'zepto', 'swiggy', 'tataneu', 'dailymart4u', 'f.nooncdn', 
-            'exportersindia', 'indiamart', 'dmart'
+            'exportersindia', 'indiamart', 'dmart', 'veehafoods', 'amazon', 'flipkart'
         ]
         if any(t in combined for t in trusted):
-            score += 20.0
+            score += 30.0
 
-        # 5. SPAM / STOCK PENALTY
-        spam = ['pinterest', 'wallpaper', 'facebook', 'instagram', 'clipart', 'vector', 'cartoon', 'recipe', 'meme']
+        # Spam / stock penalty
+        spam = [
+            'pinterest', 'wallpaper', 'facebook', 'instagram', 'clipart', 'vector', 
+            'cartoon', 'recipe', 'meme', 'fishbioclear', 'alamy', 'shutterstock',
+            'dreamstime', 'freepik', 'vecteezy', 'istockphoto'
+        ]
         if any(s in combined for s in spam):
-            score -= 60.0
+            score -= 100.0
 
         scored.append((score, item, brand_match_count))
 
@@ -416,6 +517,8 @@ async def search_searxng_image(
       * For Variant Image (WITH SIZE):
         Strictly requires exact variant size printed on packet. If candidate #1 doesn't have it,
         auto-advances to candidate #2, #3... until exact matching size is found!
+      * Strictly rejects multi-packs/twin-packs when query asks for single pack.
+      * Strictly rejects competitor brands (Rajbhog, Narayani, etc.).
     """
     base_url = base_url.rstrip("/")
     search_url = f"{base_url}/search"
@@ -465,7 +568,6 @@ async def search_searxng_image(
         if not ranked_results:
             ranked_results = raw_results
 
-        # Take up to 20 candidates as instructed by user ("tm 20 lo ek baar me")
         candidate_items: List[ImageResult] = []
         for item in ranked_results[:top_limit]:
             img_src = normalize_url(item.get("img_src"))
@@ -479,7 +581,6 @@ async def search_searxng_image(
             thumb = thumbnail_src or img_src or direct_img
 
             if direct_img:
-                # Exclude JioMart URLs completely as requested
                 if any(b in direct_img.lower() or b in page_url.lower() for b in ['jiomart']):
                     continue
 
@@ -500,33 +601,46 @@ async def search_searxng_image(
                 "error_message": "No valid image links found"
             }
 
+        query_is_combo = is_query_multipack(product_name, variant_label)
         selected_index = -1
 
         # Step 2: Strict Vision / PaddleOCR Inspection
-        # Loop through top candidates to find exact match
-        for idx, candidate in enumerate(candidate_items[:12]):
+        for idx, candidate in enumerate(candidate_items[:15]):
             cand_url = candidate.img_src
+            page_url = candidate.url
             title = candidate.title
+            cand_context = f"{cand_url} {page_url}"
 
-            # Fast metadata pre-check: skip immediately if title/url conflicts with brand or category
-            if not verify_brand_match([], title, brand, cand_url):
+            # Multi-pack check
+            cand_multi = is_candidate_multipack(title, cand_context)
+            if not query_is_combo and cand_multi:
                 continue
-            if not verify_product_keyword_match([], title, product_name, cand_url):
+            if query_is_combo and not cand_multi:
+                continue
+
+            # Fast metadata pre-check
+            if not verify_brand_match([], title, brand, cand_context):
+                continue
+            if not verify_product_keyword_match([], title, product_name, cand_context):
                 continue
 
             # Run OCR on packaging image
             img_to_ocr = candidate.thumbnail_src or candidate.img_src
             words = await extract_image_ocr_text(client, img_to_ocr, timeout=1.5)
 
-            # Re-verify brand and category with OCR text
-            if not verify_brand_match(words, title, brand, cand_url):
+            # Re-verify multi-pack with OCR text
+            if not query_is_combo and is_candidate_multipack(title, cand_context, words):
                 continue
-            if not verify_product_keyword_match(words, title, product_name, cand_url):
+
+            # Re-verify brand and category with OCR text
+            if not verify_brand_match(words, title, brand, cand_context):
+                continue
+            if not verify_product_keyword_match(words, title, product_name, cand_context):
                 continue
 
             if is_variant and variant_label:
                 # WITH SIZE: Must contain exact variant size on pack / title / url
-                has_exact = verify_variant_size(words, title, variant_label, cand_url)
+                has_exact = verify_variant_size(words, title, variant_label, cand_context)
                 if has_exact:
                     selected_index = idx
                     break
@@ -537,12 +651,17 @@ async def search_searxng_image(
                     selected_index = idx
                     break
 
-        # Fallback: if strict size match wasn't met, search for any candidate with matching brand & product
+        # Fallback: if strict size match wasn't met, search for any candidate with matching brand & product & combo consistency
         if selected_index == -1:
             for idx, candidate in enumerate(candidate_items):
+                cand_context = f"{candidate.img_src} {candidate.url}"
+                cand_multi = is_candidate_multipack(candidate.title, cand_context)
+                if not query_is_combo and cand_multi:
+                    continue
+
                 words = ocr_cache.get(candidate.thumbnail_src or candidate.img_src, [])
-                if verify_brand_match(words, candidate.title, brand, candidate.img_src) and \
-                   verify_product_keyword_match(words, candidate.title, product_name, candidate.img_src):
+                if verify_brand_match(words, candidate.title, brand, cand_context) and \
+                   verify_product_keyword_match(words, candidate.title, product_name, cand_context):
                     selected_index = idx
                     break
 

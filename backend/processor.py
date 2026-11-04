@@ -7,7 +7,7 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 import httpx
 from models import SearchConfig, JobStatus, RowResult, ImageResult
-from searxng_client import search_searxng_image, sanitize_search_query
+from searxng_client import search_searxng_image, sanitize_search_query, is_query_multipack
 
 PRODUCT_MASTER_30_COLUMNS = [
     'sku', 'variant_label', 'product_name', 'product_description',
@@ -303,13 +303,6 @@ class SearchJob:
                 row.status = "SUCCESS"
             elif row.product_image_url or row.variant_image_url:
                 row.status = "PARTIAL"
-                # Fallback to copy if one is missing
-                if not row.product_image_url:
-                    row.product_image_url = row.variant_image_url
-                    row.product_thumbnail_url = row.variant_thumbnail_url
-                if not row.variant_image_url:
-                    row.variant_image_url = row.product_image_url
-                    row.variant_thumbnail_url = row.product_thumbnail_url
             else:
                 row.status = "NOT_FOUND"
 
@@ -377,6 +370,8 @@ class JobManager:
             if not clean_p_name:
                 clean_p_name = prod_name
 
+            is_combo = is_query_multipack(prod_name, variant)
+
             # Query 1: Product Image (WITHOUT SIZE) -> brand + clean_p_name + front packaging pouch
             p_parts = []
             if config.query_prefix:
@@ -388,10 +383,10 @@ class JobManager:
             if config.query_suffix:
                 p_parts.append(config.query_suffix.strip())
             else:
-                p_parts.append("front packaging pouch")
+                p_parts.append("single pack front packaging" if not is_combo else "front packaging pouch")
             product_query = sanitize_search_query(" ".join(p_parts).strip() or clean_p_name or brand or "product")
 
-            # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label + front packaging pack
+            # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label + single/combo pack front packaging
             v_parts = []
             if config.query_prefix:
                 v_parts.append(config.query_prefix.strip())
@@ -404,7 +399,7 @@ class JobManager:
             if config.query_suffix:
                 v_parts.append(config.query_suffix.strip())
             else:
-                v_parts.append("front packaging pack")
+                v_parts.append("combo pack front packaging" if is_combo else "single pack front packaging")
             variant_query = sanitize_search_query(" ".join(v_parts).strip() or product_query)
 
             job.row_results.append(RowResult(
@@ -481,44 +476,27 @@ class JobManager:
                         row_res.product_engine = best_p.engine
                         row_res.product_alternatives = res_p.get("alternatives", [])
 
-                    # 2. Search Variant Image (With Size)
-                    # If variant query is identical to product query, reuse result to save API calls
-                    if row_res.variant_query == row_res.product_query and res_p["status"] == "SUCCESS":
-                        row_res.variant_status = "SUCCESS"
-                        row_res.variant_image_url = row_res.product_image_url
-                        row_res.variant_thumbnail_url = row_res.product_thumbnail_url
-                        row_res.variant_resolution = row_res.product_resolution
-                        row_res.variant_engine = row_res.product_engine
-                        row_res.variant_alternatives = list(row_res.product_alternatives)
-                    else:
-                        res_v = await search_searxng_image(
-                            client=client,
-                            base_url=config.searxng_url,
-                            query=row_res.variant_query,
-                            brand=b_val,
-                            product_name=p_val,
-                            variant_label=v_val,
-                            is_variant=True,
-                            safesearch=config.safesearch,
-                            time_range=config.time_range,
-                            language=config.language
-                        )
-                        row_res.variant_status = res_v["status"]
-                        if res_v["status"] == "SUCCESS" and res_v["best_image"]:
-                            best_v = res_v["best_image"]
-                            row_res.variant_image_url = clean_image_link(best_v.img_src)
-                            row_res.variant_thumbnail_url = clean_image_link(best_v.thumbnail_src) or row_res.variant_image_url
-                            row_res.variant_resolution = best_v.resolution
-                            row_res.variant_engine = best_v.engine
-                            row_res.variant_alternatives = res_v.get("alternatives", [])
-
-                    # Handle fallback if one image found and the other missing
-                    if row_res.product_image_url and not row_res.variant_image_url:
-                        row_res.variant_image_url = row_res.product_image_url
-                        row_res.variant_thumbnail_url = row_res.product_thumbnail_url
-                    elif row_res.variant_image_url and not row_res.product_image_url:
-                        row_res.product_image_url = row_res.variant_image_url
-                        row_res.product_thumbnail_url = row_res.variant_thumbnail_url
+                    # 2. Search Variant Image (With Size) - Separate independent search and inspection
+                    res_v = await search_searxng_image(
+                        client=client,
+                        base_url=config.searxng_url,
+                        query=row_res.variant_query,
+                        brand=b_val,
+                        product_name=p_val,
+                        variant_label=v_val,
+                        is_variant=True,
+                        safesearch=config.safesearch,
+                        time_range=config.time_range,
+                        language=config.language
+                    )
+                    row_res.variant_status = res_v["status"]
+                    if res_v["status"] == "SUCCESS" and res_v["best_image"]:
+                        best_v = res_v["best_image"]
+                        row_res.variant_image_url = clean_image_link(best_v.img_src)
+                        row_res.variant_thumbnail_url = clean_image_link(best_v.thumbnail_src) or row_res.variant_image_url
+                        row_res.variant_resolution = best_v.resolution
+                        row_res.variant_engine = best_v.engine
+                        row_res.variant_alternatives = res_v.get("alternatives", [])
 
                     # Determine overall status
                     if row_res.product_image_url and row_res.variant_image_url:
@@ -592,12 +570,6 @@ class JobManager:
 
             prod_link = clean_image_link(row_res.product_image_url)
             var_link = clean_image_link(row_res.variant_image_url)
-
-            # Fallbacks so cell is never blank if an image exists
-            if not prod_link and var_link:
-                prod_link = var_link
-            if not var_link and prod_link:
-                var_link = prod_link
 
             prod_name = row_dict.get("product_name", "")
             if "brand_name" in row_dict:
