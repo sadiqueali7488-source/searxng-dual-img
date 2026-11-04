@@ -195,7 +195,7 @@ export default function App() {
   const [additionalColumns, setAdditionalColumns] = useState([]);
   const [queryPrefix, setQueryPrefix] = useState('');
   const [querySuffix, setQuerySuffix] = useState('');
-  const [concurrency, setConcurrency] = useState(6);
+  const [concurrency, setConcurrency] = useState(12);
   const [delayMs, setDelayMs] = useState(100);
   const [safesearch, setSafesearch] = useState(0);
   const [limitRows, setLimitRows] = useState(0);
@@ -978,7 +978,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                       <input
                         type="range"
                         min="1"
-                        max="12"
+                        max="24"
                         value={concurrency}
                         onChange={(e) => setConcurrency(Number(e.target.value))}
                         className="w-full accent-indigo-500 cursor-pointer"

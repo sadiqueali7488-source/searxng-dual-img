@@ -1098,15 +1098,20 @@ async def _search_uncached(
                 return "exact"
             return "fallback"
 
-        # Step 2: Strict Vision / PP-OCRv6 Inspection, OCR_BATCH candidates at a time in rank order.
-        # Stops at the first batch containing an exact match, so most searches OCR only 4-8 images.
+        # Step 2: Strict Vision / PP-OCRv6 Inspection in rank order.
+        # The top-ranked image is checked alone first (it is usually the right front, so most
+        # searches need a single OCR); after that OCR_BATCH candidates are checked in parallel.
+        # Stops at the first batch containing an exact match.
         verdicts: Dict[int, str] = {}
-        for start in range(0, len(candidate_items), OCR_BATCH):
-            batch = list(range(start, min(start + OCR_BATCH, len(candidate_items))))
+        start = 0
+        while start < len(candidate_items):
+            size = 1 if start == 0 else OCR_BATCH
+            batch = list(range(start, min(start + size, len(candidate_items))))
             results = await asyncio.gather(*(inspect(candidate_items[i]) for i in batch))
             verdicts.update(zip(batch, results))
             if "exact" in results:
                 break
+            start += size
 
         def first(kind: str) -> int:
             return next((i for i in sorted(verdicts) if verdicts[i] == kind), -1)
