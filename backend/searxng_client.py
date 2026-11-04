@@ -194,6 +194,22 @@ GENERIC_BRAND_WORDS = {
     'international', 'products', 'pvts', 'ltd', 'enterprises', 'enterprise'
 }
 
+DERIVATIVE_DISQUALIFIERS = [
+    'noodles', 'noodle', 'biscuit', 'biscuits', 'cookie', 'cookies', 'cake',
+    'ladoo', 'laddu', 'barfi', 'halwa', 'sev', 'bhujia', 'namkeen', 'chips',
+    'snack', 'snacks', 'drink', 'pasta', 'vermicelli', 'papad'
+]
+
+SIBLING_FLOUR_CATEGORIES = {
+    'maida': ['besan', 'sooji', 'suji', 'rava', 'dalia', 'poha'],
+    'besan': ['maida', 'sooji', 'suji', 'rava', 'dalia', 'poha'],
+    'sooji': ['maida', 'besan', 'atta'],
+    'atta': ['maida', 'besan', 'sooji'],
+    'salt': ['atta', 'oil', 'flour', 'besan', 'sooji'],
+    'oil': ['salt', 'ghee', 'atta', 'flour'],
+    'ghee': ['oil', 'butter milk']
+}
+
 def contains_conflicting_brand(text: str, target_brand: str) -> bool:
     """Checks if text contains a competitor brand that is not the target brand."""
     if not text or not target_brand:
@@ -268,12 +284,19 @@ def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") 
     return is_dynamic_brand_match(full_context, brand, words)
 
 def verify_product_keyword_match(words: List[str], title: str, product_name: str, brand: str = "", url: str = "") -> bool:
-    """Ensures core product nouns and distinct sub-types match for ANY category (Chocolates, Apparel, FMCG, Groceries)."""
+    """
+    Dynamic, order-independent product matcher.
+    - If product name is short (<= 2 words), matches exact product nouns and rejects conflicting derivatives.
+    - Matches tokens in ANY order/permutation in packaging OCR text or title.
+    - Rejects derivative food products (e.g. noodles, ladoo, biscuits, cake, drinks) when raw staple is requested.
+    - Universal for FMCG, Chocolates, Groceries, and Apparel.
+    """
     if not product_name:
         return True
-    full_text = (" ".join(words) + " " + title + " " + url).lower()
-    p_lower = product_name.lower()
-    b_lower = (brand or "").lower()
+    ocr_str = " ".join(words or []).lower()
+    full_text = f"{ocr_str} {title} {url}".lower()
+    p_lower = product_name.lower().strip()
+    b_lower = (brand or "").lower().strip()
 
     # 1. UNIVERSAL PRODUCT TOKEN MATCHING:
     # Extracts clean product tokens (excluding brand words, stop words, and unit tokens)
@@ -295,21 +318,39 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
             continue
         prod_tokens.append(t_clean)
 
+    clean_comb_str = re.sub(r'[^a-z0-9]', '', full_text)
+
+    # 2. Dynamic Order-Independent Product Token Check:
     if prod_tokens:
-        clean_comb_str = re.sub(r'[^a-z0-9]', '', full_text)
         matched = 0
         for pt in prod_tokens:
             if re.search(rf'\b{re.escape(pt)}\b', full_text) or pt in clean_comb_str:
                 matched += 1
-        match_ratio = matched / len(prod_tokens)
+        
+        # If product name has 1-2 words (e.g. "Maida", "Besan", "Chana Sattu", "Salt", "Crop Top"):
+        # ALL tokens must be present! Zero dilution allowed.
         if len(prod_tokens) <= 2:
-            if match_ratio < 1.0:
+            if matched < len(prod_tokens):
                 return False
         else:
-            if match_ratio < 0.65:
+            # Multi-word product (e.g. "Meri Chakki Beetroot Atta", "Foxtail Millet Flour"):
+            # Must match at least 80% of tokens
+            if matched / len(prod_tokens) < 0.8:
                 return False
 
-    # 2. MILLET SPECIES LOCK:
+    # 3. Disqualify snack / derivative modifications if target doesn't ask for them
+    for disq in DERIVATIVE_DISQUALIFIERS:
+        if disq not in p_lower and re.search(rf'\b{re.escape(disq)}\b', full_text):
+            return False
+
+    # 4. Sibling category conflict check for short product names
+    for cat, siblings in SIBLING_FLOUR_CATEGORIES.items():
+        if cat in p_lower:
+            for sib in siblings:
+                if sib not in p_lower and re.search(rf'\b{re.escape(sib)}\b', full_text):
+                    return False
+
+    # 5. MILLET SPECIES LOCK:
     millet_species = {
         'foxtail': ['foxtail', 'kangni'],
         'bajra': ['bajra', 'pearl millet', 'pearlmillet'],
@@ -330,14 +371,14 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
                 if any(re.search(rf'\b{re.escape(oa)}\b', full_text) for oa in other_aliases):
                     return False
 
-    # 2. FORM LOCK: Flour / Atta vs Whole Grain
+    # 6. FORM LOCK: Flour / Atta vs Whole Grain
     has_flour = any(f in p_lower for f in ['flour', 'atta', 'peeth', 'powder'])
     if has_flour:
         cand_has_flour = any(f in full_text for f in ['flour', 'atta', 'peeth', 'powder', 'maida', 'besan', 'sooji', 'sattu'])
         if ('pearled' in full_text or 'parboiled' in full_text) and not cand_has_flour:
             return False
 
-    # 3. DISTINCTIVE FLAVOR / SUB-TYPE CHECK:
+    # 7. DISTINCTIVE FLAVOR / SUB-TYPE CHECK (Order-independent):
     distinctive_subtypes = [
         'beetroot', 'methi', 'khapli', 'multigrain', '7 grain', '7grain', 'sharbati',
         'ragi', 'sooji', 'suji', 'maida', 'besan', 'sattu', 'cornflour', 'corn flour',
@@ -351,10 +392,10 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
             elif sub in ['cornflour', 'corn flour']:
                 if not any(cf in full_text for cf in ['cornflour', 'corn flour', 'corn starch']):
                     return False
-            elif sub not in full_text:
+            elif sub not in full_text and sub not in clean_comb_str:
                 return False
 
-    # 4. CORE CATEGORIES LOCK (e.g. sattu != dal, salt != atta, oil != ghee, maida != besan)
+    # 8. CORE CATEGORIES LOCK (e.g. sattu != dal, salt != atta, oil != ghee, maida != besan)
     if 'sattu' in p_lower and 'sattu' not in full_text:
         return False
     if 'maida' in p_lower and not any(m in full_text for m in ['maida', 'refined wheat flour', 'all purpose flour']):
@@ -432,6 +473,10 @@ def score_and_rank_images(
             continue
 
         score = 0.0
+
+        # Prioritize Google Images engine results above all others
+        if item.get("engine") == "google images":
+            score += 500.0
 
         # Combo preference
         if query_is_combo:
@@ -573,7 +618,7 @@ async def search_searxng_image(
     params = {
         "q": clean_q,
         "category_images": 1,
-        "engines": "google images,bing images,brave.images",
+        "engines": "google images",
         "pageno": 1,
         "language": language,
         "time_range": time_range,
@@ -582,17 +627,28 @@ async def search_searxng_image(
     }
 
     try:
-        response = await client.get(search_url, params=params)
-        if response.status_code != 200:
-            return {
-                "status": "ERROR",
-                "best_image": None,
-                "alternatives": [],
-                "error_message": f"HTTP {response.status_code}: {response.text[:120]}"
-            }
+        raw_results = []
+        try:
+            # 1. Primary: Use Google Images strictly
+            resp_g = await client.get(search_url, params=params)
+            if resp_g.status_code == 200:
+                raw_results = resp_g.json().get("results", [])
+        except Exception:
+            raw_results = []
 
-        data = response.json()
-        raw_results = data.get("results", [])
+        # 2. Resilient Fallback: If Google Images is temporarily blocked/suspended by SearXNG, query bing images
+        if not raw_results:
+            fallback_params = {**params, "engines": "bing images"}
+            resp_fb = await client.get(search_url, params=fallback_params)
+            if resp_fb.status_code == 200:
+                raw_results = resp_fb.json().get("results", [])
+            else:
+                return {
+                    "status": "ERROR",
+                    "best_image": None,
+                    "alternatives": [],
+                    "error_message": f"HTTP {resp_fb.status_code}: {resp_fb.text[:120]}"
+                }
 
         if not raw_results:
             return {
@@ -654,7 +710,7 @@ async def search_searxng_image(
             cand_url = candidate.img_src
             page_url = candidate.url
             title = candidate.title
-            cand_context = f"{cand_url} {page_url}"
+            cand_context = f"{title} {cand_url} {page_url}"
 
             # Multi-pack check
             cand_multi = is_candidate_multipack(title, cand_context)
@@ -699,7 +755,7 @@ async def search_searxng_image(
         # Fallback: if strict size match wasn't met, search for any candidate with matching brand & product & combo consistency
         if selected_index == -1:
             for idx, candidate in enumerate(candidate_items):
-                cand_context = f"{candidate.img_src} {candidate.url}"
+                cand_context = f"{candidate.title} {candidate.img_src} {candidate.url}"
                 cand_multi = is_candidate_multipack(candidate.title, cand_context)
                 if not query_is_combo and cand_multi:
                     continue
