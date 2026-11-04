@@ -126,8 +126,8 @@ def has_any_size_callout(words: List[str], title: str = "", url: str = "") -> bo
         return True
     return False
 
-def verify_variant_size(words: List[str], title: str, variant_label: str, url: str = "") -> bool:
-    """Checks if image text, title, or url contains the EXACT requested variant size."""
+def verify_size_strict(words: List[str], title: str, variant_label: str, url: str = "") -> bool:
+    """Strictly checks if candidate contains EXACT variant size and no conflicting printed weight."""
     if not variant_label:
         return False
     m = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr|lb)?', variant_label.lower())
@@ -150,7 +150,21 @@ def verify_variant_size(words: List[str], title: str, variant_label: str, url: s
         f"{num}ltr",
         f"{num}lb"
     ]
-    return any(t in clean for t in targets)
+    has_target = any(t in clean for t in targets)
+    if not has_target:
+        return False
+
+    # Check if OCR words on the packet clearly show a conflicting weight
+    if words and len(words) >= 2:
+        ocr_str = " ".join(words).lower()
+        other_sizes = re.findall(r'\b(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr)\b', ocr_str)
+        target_unit_norm = 'g' if unit in ['g', 'gm', 'gms'] else ('l' if unit in ['l', 'ltr', 'litre', 'liter'] else unit)
+        for o_num, o_unit in other_sizes:
+            o_unit_norm = 'g' if o_unit in ['g', 'gm', 'gms'] else ('l' if o_unit in ['l', 'ltr', 'litre', 'liter'] else o_unit)
+            if o_num != num and o_unit_norm == target_unit_norm:
+                return False
+
+    return True
 
 COMPETITOR_BRANDS = [
     'rajbhog', 'narayani', 'patanjali', 'fortune', 'saffola', 'catch', 'everest',
@@ -160,6 +174,14 @@ COMPETITOR_BRANDS = [
     'aachi', 'priya', 'suhana', 'badshah', 'ramdev', 'annapurna', 'bawarchi',
     'sarveshwari', 'goldiee', 'goldie', 'suruchi', 'saras', 'devaiah', '9am'
 ]
+
+GENERIC_BRAND_WORDS = {
+    'super', 'royal', 'popular', 'premium', 'classic', 'gold', 'special', 
+    'fresh', 'best', 'select', 'choice', 'daily', 'smart', 'star', 'plus',
+    'saver', 'delight', 'lite', 'rich', 'shudh', 'original', 'natural',
+    'organic', 'pure', 'food', 'foods', 'brand', 'brands', 'india', 
+    'international', 'products', 'pvts', 'ltd', 'enterprises', 'enterprise'
+}
 
 def contains_conflicting_brand(text: str, target_brand: str) -> bool:
     """Checks if text contains a competitor brand that is not the target brand."""
@@ -177,89 +199,71 @@ def contains_conflicting_brand(text: str, target_brand: str) -> bool:
             return True
     return False
 
-def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") -> bool:
-    """Checks if brand name exists in image OCR text, title, or URL, and strictly rejects competitor brands."""
-    if not brand:
+def is_dynamic_brand_match(full_text: str, target_brand: str, ocr_words: Optional[List[str]] = None) -> bool:
+    """
+    Universal, strict dynamic brand matcher for ANY FMCG brand in ANY Excel sheet.
+    Rejects partial generic words (e.g. 'super' matching 'bb Super Saver', or 'bb Royal' matching 'bb Super Saver').
+    """
+    if not target_brand:
         return True
-    brand_clean = brand.strip().lower()
-    full_text = (" ".join(words) + " " + title + " " + url).lower()
 
-    # 1. STRICT COMPETITOR BRAND CHECK:
-    if contains_conflicting_brand(full_text, brand):
+    b_clean = target_brand.strip().lower()
+    text_clean = full_text.lower()
+    ocr_str = " ".join(ocr_words or []).lower()
+    combined = f"{text_clean} {ocr_str}"
+
+    # 1. Competitor conflict check
+    if contains_conflicting_brand(combined, target_brand):
         return False
 
-    # 2. IF OCR WORDS EXIST, VERIFY BRAND PRINTED ON PACKAGING:
-    if words and len(words) >= 2:
-        ocr_text = " ".join(words).lower()
-        if 'aashirvaad' in brand_clean:
-            if not ('aashirvaad' in ocr_text or 'asirvad' in ocr_text or 'ashirwad' in ocr_text):
-                return False
-        elif 'sampann' in brand_clean:
-            if not ('sampann' in ocr_text or 'tata' in ocr_text):
-                return False
-        elif 'mantra' in brand_clean:
-            if not ('mantra' in ocr_text or '24' in ocr_text):
-                return False
-        elif 'amul' in brand_clean:
-            if not ('amul' in ocr_text):
-                return False
-        elif 'fortune' in brand_clean:
-            if not ('fortune' in ocr_text):
-                return False
-        elif 'saffola' in brand_clean:
-            if not ('saffola' in ocr_text):
-                return False
-        elif '9am' in brand_clean:
-            if not ('9am' in ocr_text or '9 am' in ocr_text):
-                return False
+    # 2. Exact full brand phrase match (e.g. "bb super saver" in "bb-super-saver" or "bb supersaver")
+    clean_b_str = re.sub(r'[^a-z0-9]', '', b_clean)
+    clean_comb_str = re.sub(r'[^a-z0-9]', '', combined)
 
-    # 3. Known brand keys
-    known_brand_keys = {
-        'tata': ['tata'],
-        'tata sampann': ['sampann'],
-        '24 mantra': ['mantra'],
-        '24 mantra organic': ['mantra'],
-        'aashirvaad': ['aashirvaad', 'asirvad', 'ashirwad'],
-        'fortune': ['fortune'],
-        'saffola': ['saffola'],
-        'daawat': ['daawat', 'dawat'],
-        'amul': ['amul'],
-        'everest': ['everest'],
-        'mdh': ['mdh'],
-        'catch': ['catch'],
-        '9am': ['9am', '9 am'],
-        'nestle': ['nestle', 'maggi'],
-        'patanjali': ['patanjali'],
-        'britannia': ['britannia'],
-        'parle': ['parle'],
-        'sunfeast': ['sunfeast'],
-        'haldiram': ['haldiram'],
-        'bikaji': ['bikaji'],
-        'mtr': ['mtr'],
-        'dhara': ['dhara'],
-        'gemini': ['gemini'],
-        'emami': ['emami'],
-        'mother dairy': ['mother dairy'],
-        'country delight': ['country delight'],
-    }
-    for k, keys in known_brand_keys.items():
-        if k in brand_clean:
-            return any(key in full_text for key in keys)
-
-    brand_tokens = [t for t in re.split(r'[\s\-_]+', brand_clean) if len(t) >= 3 and t not in {'organic', 'pure', 'food', 'foods', 'brand', 'india', 'international'}]
-    if not brand_tokens:
+    if clean_b_str in clean_comb_str:
         return True
-    return any(bt in full_text for bt in brand_tokens)
+
+    # 3. Tokenize brand into non-filler words
+    filler_words = {'organic', 'pure', 'food', 'foods', 'brand', 'brands', 'india', 'international', 'products', 'pvts', 'ltd'}
+    tokens = [t for t in re.split(r'[\s\-_]+', b_clean) if len(t) >= 2 and t not in filler_words]
+    if not tokens:
+        return True
+
+    # Single-word brand (e.g. "Aashirvaad", "Patanjali", "Amul", "Fortune", "9AM", "Catch", "Everest")
+    if len(tokens) == 1:
+        t = tokens[0]
+        return bool(re.search(rf'\b{re.escape(t)}\b', combined) or t in clean_comb_str)
+
+    # Multi-word brand (e.g. "bb Super Saver", "bb Royal", "Tata Sampann", "Tata Salt"):
+    matched_count = 0
+    for t in tokens:
+        if re.search(rf'\b{re.escape(t)}\b', combined) or t in clean_comb_str:
+            matched_count += 1
+
+    match_ratio = matched_count / len(tokens)
+
+    # For 2-word brands (e.g. "Tata Sampann", "bb Royal"): both words must match (100%)
+    if len(tokens) == 2:
+        return match_ratio >= 1.0
+    else:
+        # For 3+ words (e.g. 'bb super saver'): at least 67% must match AND primary first token must match
+        first_token = tokens[0]
+        first_matches = bool(re.search(rf'\b{re.escape(first_token)}\b', combined) or first_token in clean_comb_str)
+        return match_ratio >= 0.67 and first_matches
+
+def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") -> bool:
+    """Combines dynamic brand matching with OCR packaging verification."""
+    full_context = f"{title} {url}"
+    return is_dynamic_brand_match(full_context, brand, words)
 
 def verify_product_keyword_match(words: List[str], title: str, product_name: str, url: str = "") -> bool:
-    """Ensures the core product and all distinct sub-types / flavors match (e.g. beetroot, methi, sattu)."""
+    """Ensures core product nouns and all distinct sub-types match. Aadha-adhura information REJECT!"""
     if not product_name:
         return True
     full_text = (" ".join(words) + " " + title + " " + url).lower()
     p_lower = product_name.lower()
 
     # 1. MILLET SPECIES LOCK:
-    # Strictly isolate Foxtail, Bajra, Ragi, Jowar, Kodo, Little, Barnyard
     millet_species = {
         'foxtail': ['foxtail', 'kangni'],
         'bajra': ['bajra', 'pearl millet', 'pearlmillet'],
@@ -283,8 +287,7 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
     # 2. FORM LOCK: Flour / Atta vs Whole Grain
     has_flour = any(f in p_lower for f in ['flour', 'atta', 'peeth', 'powder'])
     if has_flour:
-        cand_has_flour = any(f in full_text for f in ['flour', 'atta', 'peeth', 'powder'])
-        # If image or text specifically states it is unhulled grain / pearled grain without flour:
+        cand_has_flour = any(f in full_text for f in ['flour', 'atta', 'peeth', 'powder', 'maida', 'besan', 'sooji', 'sattu'])
         if ('pearled' in full_text or 'parboiled' in full_text) and not cand_has_flour:
             return False
 
@@ -305,8 +308,12 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
             elif sub not in full_text:
                 return False
 
-    # 4. CORE CATEGORIES LOCK (e.g. sattu != dal, salt != atta, oil != ghee)
+    # 4. CORE CATEGORIES LOCK (e.g. sattu != dal, salt != atta, oil != ghee, maida != besan)
     if 'sattu' in p_lower and 'sattu' not in full_text:
+        return False
+    if 'maida' in p_lower and not any(m in full_text for m in ['maida', 'refined wheat flour', 'all purpose flour']):
+        return False
+    if 'besan' in p_lower and not any(b in full_text for b in ['besan', 'gram flour', 'chana flour']):
         return False
     if 'salt' in p_lower and any(c in full_text for c in ['atta', 'oil', 'flour']):
         return False
@@ -324,13 +331,11 @@ def score_and_rank_images(
     variant_label: str = "",
     is_variant: bool = False
 ) -> List[Dict[str, Any]]:
-    """Scores candidate images by metadata relevance and strict brand/combo filters."""
+    """Scores candidate images by metadata relevance, universal dynamic brand check, and combo filters."""
     if not results:
         return []
 
     brand_clean = (brand or "").strip().lower()
-    brand_tokens = [t for t in re.split(r'[\s\-_]+', brand_clean) if len(t) >= 2]
-
     stop_words = {'100', 'pure', 'pack', 'pouch', 'packet', 'the', 'and', 'for', 'with', 'original', 'best', 'organic', 'grade'}
     prod_clean = (product_name or "").strip().lower()
     prod_tokens = [t for t in re.split(r'[\s\-_]+', prod_clean) if len(t) >= 3 and t not in stop_words]
@@ -351,28 +356,33 @@ def score_and_rank_images(
         if any(b in combined for b in blocked_domains):
             continue
 
-        # 1. STRICT COMPETITOR BRAND FILTER:
-        # If competitor brand is found, completely drop candidate!
+        # 1. STRICT COMPETITOR BRAND FILTER
         if contains_conflicting_brand(combined, brand):
             continue
 
-        # 2. MULTI-PACK VS SINGLE PACK FILTER:
-        cand_is_combo = is_candidate_multipack(title, f"{img_url} {page_url}")
-        if not query_is_combo and cand_is_combo:
-            # Query is SINGLE pack (500g, 1kg), candidate is multi-pack/combo -> REJECT!
+        # 2. DYNAMIC BRAND CHECK:
+        # If target brand is given, candidate MUST match the brand dynamically (no generic single word false positives!)
+        if brand and not is_dynamic_brand_match(combined, brand):
             continue
 
-        # 3. MILLET SPECIES CONFLICT FILTER:
+        # 3. MULTI-PACK VS SINGLE PACK FILTER
+        cand_is_combo = is_candidate_multipack(title, f"{img_url} {page_url}")
+        if not query_is_combo and cand_is_combo:
+            continue
+
+        # 4. MILLET SPECIES CONFLICT FILTER
         if 'foxtail' in prod_clean:
             if any(m in combined for m in ['bajra', 'pearl millet', 'ragi', 'jowar', 'kodo']):
                 continue
         if 'bajra' in prod_clean and any(m in combined for m in ['foxtail', 'ragi', 'jowar']):
             continue
 
-        # 4. DISTINCTIVE FLAVOR / SUB-TYPE FILTER:
+        # 5. DISTINCTIVE FLAVOR / SUB-TYPE FILTER
         if 'beetroot' in prod_clean and 'beetroot' not in combined:
             continue
         if 'sattu' in prod_clean and 'sattu' not in combined:
+            continue
+        if 'maida' in prod_clean and not any(m in combined for m in ['maida', 'refined wheat flour']):
             continue
 
         score = 0.0
@@ -384,31 +394,18 @@ def score_and_rank_images(
             else:
                 score -= 50.0
 
-        # Brand matching
-        brand_match_count = 0
-        if brand_tokens:
-            for bt in brand_tokens:
-                if bt in combined:
-                    brand_match_count += 1
-
-            if brand_match_count == len(brand_tokens):
-                score += 100.0
-                has_any_brand_match = True
-            elif brand_match_count > 0:
-                score += 50.0
-                has_any_brand_match = True
-            else:
-                score -= 80.0
+        # Dynamic Brand scoring
+        if brand:
+            score += 100.0
+            has_any_brand_match = True
 
         # Product name keywords
         for pt in prod_tokens:
-            if pt in brand_tokens:
-                continue
             if pt in combined:
                 if pt in ['beetroot', 'methi', 'khapli', 'ragi', 'sharbati', 'multigrain', '7grain']:
                     score += 80.0
                 elif pt in ['sattu', 'besan', 'atta', 'maida', 'sooji', 'flour', 'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee', 'sugar', 'salt', 'masala', 'cornflour', 'poha', 'dalia']:
-                    score += 45.0
+                    score += 50.0
                 else:
                     score += 25.0
 
@@ -440,7 +437,12 @@ def score_and_rank_images(
             'exportersindia', 'indiamart', 'dmart', 'veehafoods', 'amazon', 'flipkart'
         ]
         if any(t in combined for t in trusted):
-            score += 30.0
+            score += 35.0
+
+        # Official brand store domain extra boost
+        brand_domain_slug = re.sub(r'[^a-z0-9]', '', brand_clean)
+        if brand_domain_slug and brand_domain_slug in page_url:
+            score += 50.0
 
         # Spam / stock penalty
         spam = [
@@ -451,10 +453,7 @@ def score_and_rank_images(
         if any(s in combined for s in spam):
             score -= 100.0
 
-        scored.append((score, item, brand_match_count))
-
-    if has_any_brand_match and brand_tokens:
-        scored = [x for x in scored if x[2] > 0 or x[0] > 0]
+        scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [x[1] for x in scored]
@@ -518,7 +517,7 @@ async def search_searxng_image(
         Strictly requires exact variant size printed on packet. If candidate #1 doesn't have it,
         auto-advances to candidate #2, #3... until exact matching size is found!
       * Strictly rejects multi-packs/twin-packs when query asks for single pack.
-      * Strictly rejects competitor brands (Rajbhog, Narayani, etc.).
+      * Strictly rejects competitor brands and partial generic word matches.
     """
     base_url = base_url.rstrip("/")
     search_url = f"{base_url}/search"
@@ -619,7 +618,7 @@ async def search_searxng_image(
                 continue
 
             # Fast metadata pre-check
-            if not verify_brand_match([], title, brand, cand_context):
+            if not is_dynamic_brand_match(cand_context, brand):
                 continue
             if not verify_product_keyword_match([], title, product_name, cand_context):
                 continue
@@ -633,14 +632,14 @@ async def search_searxng_image(
                 continue
 
             # Re-verify brand and category with OCR text
-            if not verify_brand_match(words, title, brand, cand_context):
+            if not is_dynamic_brand_match(cand_context, brand, words):
                 continue
             if not verify_product_keyword_match(words, title, product_name, cand_context):
                 continue
 
             if is_variant and variant_label:
                 # WITH SIZE: Must contain exact variant size on pack / title / url
-                has_exact = verify_variant_size(words, title, variant_label, cand_context)
+                has_exact = verify_size_strict(words, title, variant_label, cand_context)
                 if has_exact:
                     selected_index = idx
                     break
@@ -660,7 +659,7 @@ async def search_searxng_image(
                     continue
 
                 words = ocr_cache.get(candidate.thumbnail_src or candidate.img_src, [])
-                if verify_brand_match(words, candidate.title, brand, cand_context) and \
+                if is_dynamic_brand_match(cand_context, brand, words) and \
                    verify_product_keyword_match(words, candidate.title, product_name, cand_context):
                     selected_index = idx
                     break

@@ -685,8 +685,8 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
         </div>
       )}
 
-      {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6">
+      {/* Main Container - Full Edge-to-Edge Width */}
+      <main className="flex-1 w-full px-4 sm:px-6 lg:px-8 py-5 space-y-5">
 
         {/* STEP 1 & 2: Top Setup Cards */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -1159,291 +1159,404 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
       </main>
 
       {/* DUAL PRODUCT & VARIANT DETAILS POPUP MODAL */}
-      {detailModalRow && (
-        <div
-          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4"
-          onClick={() => setDetailModalRow(null)}
-        >
+      {detailModalRow && (() => {
+        const orig = detailModalRow.original_data || {};
+        const ignoredKeys = new Set([
+          'product_images', 'variant_images', 'image_url', 'product_image_url',
+          'variant_image_url', 'brand_image', 'category_icon', 'parent_category_icon'
+        ]);
+
+        const populatedFields = [];
+        // Priority fields first if they have non-empty values
+        const brandVal = orig.brand_name || orig.brand || orig.Brand || orig['Brand Name'] || '';
+        const sizeVal = orig.variant_label || orig.variant || orig.Variant || orig.size || orig.Size || orig.pack_size || orig['Pack Size'] || '';
+        const skuVal = orig.sku || orig.SKU || orig.Sku || '';
+        const mrpVal = orig.mrp || orig.MRP || '';
+        const priceVal = orig.sale_price || orig['Sale Price'] || orig.price || '';
+
+        if (brandVal && brandVal !== '-' && brandVal !== '—' && brandVal.toLowerCase() !== 'nan') {
+          populatedFields.push({ label: 'Brand', value: brandVal, isPrimary: true });
+        }
+        if (sizeVal && sizeVal !== '-' && sizeVal !== '—' && sizeVal.toLowerCase() !== 'nan') {
+          populatedFields.push({ label: 'Pack Size', value: sizeVal, isSize: true });
+        }
+        if (skuVal && skuVal !== '-' && skuVal !== '—' && skuVal.toLowerCase() !== 'nan') {
+          populatedFields.push({ label: 'SKU', value: skuVal, isMono: true });
+        }
+        if (mrpVal && mrpVal !== '-' && mrpVal !== '—' && mrpVal.toLowerCase() !== 'nan') {
+          populatedFields.push({ label: 'MRP', value: mrpVal, isPrice: true });
+        }
+        if (priceVal && priceVal !== '-' && priceVal !== '—' && priceVal.toLowerCase() !== 'nan') {
+          populatedFields.push({ label: 'Sale Price', value: priceVal, isPrice: true });
+        }
+
+        // Add any other non-empty columns from Excel
+        const handledKeys = new Set([
+          'brand_name', 'brand', 'brand name', 'product_name', 'product name',
+          'variant_label', 'variant', 'size', 'pack_size', 'pack size',
+          'sku', 'mrp', 'sale_price', 'sale price', 'price',
+          'product_attributes', 'variant_attributes'
+        ]);
+
+        for (const [k, v] of Object.entries(orig)) {
+          const kLower = k.toLowerCase().trim();
+          if (ignoredKeys.has(kLower) || handledKeys.has(kLower)) continue;
+          const valStr = String(v ?? '').trim();
+          if (valStr && valStr !== '-' && valStr !== '—' && valStr.toLowerCase() !== 'nan' && valStr !== '0' && valStr !== '0.0') {
+            const prettyLabel = k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            populatedFields.push({ label: prettyLabel, value: valStr });
+          }
+        }
+
+        return (
           <div
-            className="bg-slate-900 border border-slate-800 rounded-3xl max-w-5xl w-full max-h-[92vh] overflow-hidden flex flex-col shadow-2xl animate-in zoom-in-95 duration-150"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5"
+            onClick={() => setDetailModalRow(null)}
           >
-            {/* Modal Header */}
-            <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
-              <div className="flex items-center space-x-3 truncate">
-                <span className="w-7 h-7 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center font-bold text-xs shrink-0 font-mono">
-                  #{detailModalRow.row_index + 1}
-                </span>
-                <div className="truncate">
-                  <h3 className="text-base font-bold text-white truncate">
-                    {detailModalRow.original_data?.product_name || detailModalRow.query}
-                  </h3>
-                  <div className="flex items-center space-x-2 text-xs text-slate-400 mt-0.5 font-sans">
-                    {detailModalRow.original_data?.brand_name && (
-                      <span className="bg-indigo-500/10 text-indigo-300 border border-indigo-500/30 px-2 py-0.2 rounded font-semibold text-[11px]">
-                        Brand: {detailModalRow.original_data.brand_name}
-                      </span>
-                    )}
-                    {detailModalRow.original_data?.variant_label && (
-                      <span className="bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 px-2 py-0.2 rounded font-semibold text-[11px]">
-                        Size: {detailModalRow.original_data.variant_label}
-                      </span>
-                    )}
-                    <span className="text-emerald-400 font-mono font-bold">
-                      {detailModalRow.original_data?.sale_price}
-                    </span>
+            <div
+              className="bg-slate-900 border border-slate-800 rounded-3xl max-w-6xl w-full max-h-[94vh] overflow-hidden flex flex-col shadow-2xl animate-in zoom-in-95 duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal Header */}
+              <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
+                <div className="flex items-center space-x-3 truncate mr-4">
+                  <span className="w-8 h-8 rounded-xl bg-indigo-500/20 text-indigo-400 flex items-center justify-center font-bold text-xs shrink-0 font-mono border border-indigo-500/30">
+                    #{detailModalRow.row_index + 1}
+                  </span>
+                  <div className="truncate">
+                    <h3 className="text-base font-bold text-white truncate">
+                      {detailModalRow.original_data?.product_name || detailModalRow.query}
+                    </h3>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 mt-1 font-sans">
+                      {brandVal && (
+                        <span className="bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 px-2.5 py-0.5 rounded-full font-semibold text-[11px]">
+                          Brand: {brandVal}
+                        </span>
+                      )}
+                      {sizeVal && (
+                        <span className="bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 px-2.5 py-0.5 rounded-full font-semibold text-[11px]">
+                          Size: {sizeVal}
+                        </span>
+                      )}
+                      {priceVal && (
+                        <span className="text-emerald-400 font-mono font-bold bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-0.5 rounded-full text-[11px]">
+                          Price: {priceVal}
+                        </span>
+                      )}
+                      {skuVal && (
+                        <span className="text-slate-400 font-mono text-[10px] bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700/60">
+                          SKU: {skuVal}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
+
+                <button
+                  onClick={() => setDetailModalRow(null)}
+                  className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer shrink-0"
+                  title="Close modal"
+                >
+                  <X className="w-5 h-5" />
+                </button>
               </div>
 
-              <button
-                onClick={() => setDetailModalRow(null)}
-                className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Modal Body */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              
-              {/* DUAL IMAGE SIDE-BY-SIDE CARDS */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Modal Body */}
+              <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-6">
                 
-                {/* 1. PRODUCT IMAGE CARD (WITHOUT SIZE) */}
-                <div className="bg-slate-950 p-4 rounded-2xl border border-indigo-500/30 flex flex-col justify-between space-y-4">
-                  <div>
-                    <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-                      <div>
-                        <h4 className="text-xs font-bold text-indigo-300 uppercase tracking-wide">
-                          Product Image (Without Size)
-                        </h4>
-                        <p className="text-[10px] text-slate-400 font-mono truncate max-w-xs mt-0.5">
-                          Query: "{detailModalRow.product_query}"
-                        </p>
+                {/* DUAL IMAGE SIDE-BY-SIDE CARDS */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  
+                  {/* 1. PRODUCT IMAGE CARD (WITHOUT SIZE) */}
+                  <div className="bg-slate-950 p-4 sm:p-5 rounded-2xl border border-indigo-500/30 flex flex-col justify-between space-y-4 shadow-lg">
+                    <div>
+                      <div className="flex items-center justify-between pb-3 border-b border-slate-800/80">
+                        <div>
+                          <h4 className="text-xs font-bold text-indigo-300 uppercase tracking-wide flex items-center space-x-1.5">
+                            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+                            <span>Product Image (Without Size)</span>
+                          </h4>
+                        </div>
+                        <span className="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 px-2.5 py-0.5 rounded-full font-mono font-bold">
+                          Clean Packshot
+                        </span>
                       </div>
-                      <span className="text-[9px] bg-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded font-mono font-bold">
-                        General Pack
-                      </span>
-                    </div>
 
-                    {/* Preview Image */}
-                    <div className="w-full h-56 bg-slate-900/60 rounded-xl mt-3 overflow-hidden flex items-center justify-center p-2 relative group">
-                      {detailModalRow.product_image_url ? (
-                        <img
-                          src={detailModalRow.product_image_url}
-                          alt="Product"
-                          loading="lazy"
-                          decoding="async"
-                          className="max-h-full max-w-full object-contain"
-                        />
-                      ) : (
-                        <ImageIcon className="w-12 h-12 text-slate-700" />
-                      )}
-                    </div>
-
-                    {/* URL bar */}
-                    {detailModalRow.product_image_url && (
-                      <div className="mt-2 flex items-center justify-between text-[11px] font-mono text-slate-400 bg-slate-900 px-2.5 py-1.5 rounded-lg border border-slate-800">
-                        <span className="truncate max-w-[240px]">{detailModalRow.product_image_url}</span>
-                        <div className="flex items-center space-x-1 shrink-0">
+                      {/* Full Query Box (No Truncation) */}
+                      <div className="mt-3">
+                        <span className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider block mb-1">
+                          Product Search Query:
+                        </span>
+                        <div className="text-[11px] font-mono text-slate-300 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-800 flex items-center justify-between select-text break-words">
+                          <span className="break-all">{detailModalRow.product_query}</span>
                           <button
-                            onClick={(e) => copyToClipboard(detailModalRow.product_image_url, e)}
-                            className="p-1 hover:text-white cursor-pointer"
-                            title="Copy link"
+                            onClick={(e) => copyToClipboard(detailModalRow.product_query, e)}
+                            className="p-1 hover:text-white text-slate-400 ml-2 shrink-0 cursor-pointer"
+                            title="Copy query"
                           >
-                            {copiedUrl === detailModalRow.product_image_url ? (
+                            {copiedUrl === detailModalRow.product_query ? (
                               <Check className="w-3.5 h-3.5 text-emerald-400" />
                             ) : (
                               <Copy className="w-3.5 h-3.5" />
                             )}
                           </button>
-                          <a
-                            href={detailModalRow.product_image_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="p-1 hover:text-white cursor-pointer"
-                            title="Open full size"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
                         </div>
                       </div>
-                    )}
-                  </div>
 
-                  {/* Actions & Alternatives for Product Image */}
-                  <div className="space-y-3 pt-2 border-t border-slate-800">
-                    <div className="flex gap-2">
-                      <button
-                        onClick={(e) => handleCycleImage(detailModalRow.row_index, 'product', e)}
-                        disabled={cyclingKey === `${detailModalRow.row_index}-product`}
-                        className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs py-2 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 shadow-md active:scale-95"
-                      >
-                        <RotateCw className={`w-3.5 h-3.5 ${cyclingKey === `${detailModalRow.row_index}-product` ? 'animate-spin' : ''}`} />
-                        <span>Cycle Product Image ({detailModalRow.product_alternatives?.length || 0})</span>
-                      </button>
-                    </div>
+                      {/* Preview Image */}
+                      <div className="w-full h-64 bg-slate-900/60 rounded-xl mt-3 overflow-hidden flex items-center justify-center p-3 relative group border border-slate-800/60">
+                        {detailModalRow.product_image_url ? (
+                          <img
+                            src={detailModalRow.product_image_url}
+                            alt="Product"
+                            loading="lazy"
+                            decoding="async"
+                            className="max-h-full max-w-full object-contain hover:scale-105 transition duration-200"
+                          />
+                        ) : (
+                          <div className="flex flex-col items-center justify-center text-slate-600">
+                            <ImageIcon className="w-12 h-12 mb-2" />
+                            <span className="text-xs">No Product Image Found</span>
+                          </div>
+                        )}
+                      </div>
 
-                    {/* Alternatives mini grid */}
-                    {detailModalRow.product_alternatives && detailModalRow.product_alternatives.length > 0 && (
-                      <div>
-                        <div className="text-[10px] text-slate-400 mb-1.5 font-semibold">
-                          Click to select alternative:
-                        </div>
-                        <div className="grid grid-cols-4 gap-2">
-                          {detailModalRow.product_alternatives.slice(0, 4).map((alt, idx) => (
-                            <div
-                              key={idx}
-                              onClick={() => handleSelectAlternativeImage(detailModalRow.row_index, alt, 'product')}
-                              className="h-16 rounded-lg bg-slate-900 border border-slate-800 hover:border-indigo-400 overflow-hidden cursor-pointer p-1 flex items-center justify-center transition hover:scale-105"
-                              title={alt.title}
+                      {/* URL bar */}
+                      {detailModalRow.product_image_url && (
+                        <div className="mt-2.5 flex items-center justify-between text-[11px] font-mono text-slate-400 bg-slate-900 px-3 py-2 rounded-xl border border-slate-800">
+                          <span className="truncate max-w-[280px] select-text">{detailModalRow.product_image_url}</span>
+                          <div className="flex items-center space-x-1 shrink-0 ml-2">
+                            <button
+                              onClick={(e) => copyToClipboard(detailModalRow.product_image_url, e)}
+                              className="p-1.5 hover:text-white text-slate-400 cursor-pointer rounded-lg hover:bg-slate-800"
+                              title="Copy link"
                             >
-                              <img src={alt.thumbnail_src || alt.img_src} alt="alt" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
-                            </div>
-                          ))}
+                              {copiedUrl === detailModalRow.product_image_url ? (
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                            <a
+                              href={detailModalRow.product_image_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="p-1.5 hover:text-white text-slate-400 cursor-pointer rounded-lg hover:bg-slate-800"
+                              title="Open full size"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          </div>
                         </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* 2. VARIANT IMAGE CARD (WITH SIZE) */}
-                <div className="bg-slate-950 p-4 rounded-2xl border border-cyan-500/30 flex flex-col justify-between space-y-4">
-                  <div>
-                    <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-                      <div>
-                        <h4 className="text-xs font-bold text-cyan-300 uppercase tracking-wide">
-                          Variant Image (With Size)
-                        </h4>
-                        <p className="text-[10px] text-slate-400 font-mono truncate max-w-xs mt-0.5">
-                          Query: "{detailModalRow.variant_query}"
-                        </p>
-                      </div>
-                      <span className="text-[9px] bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded font-mono font-bold">
-                        Exact Size Pack
-                      </span>
-                    </div>
-
-                    {/* Preview Image */}
-                    <div className="w-full h-56 bg-slate-900/60 rounded-xl mt-3 overflow-hidden flex items-center justify-center p-2 relative group">
-                      {detailModalRow.variant_image_url ? (
-                        <img
-                          src={detailModalRow.variant_image_url}
-                          alt="Variant"
-                          loading="lazy"
-                          decoding="async"
-                          className="max-h-full max-w-full object-contain"
-                        />
-                      ) : (
-                        <ImageIcon className="w-12 h-12 text-slate-700" />
                       )}
                     </div>
 
-                    {/* URL bar */}
-                    {detailModalRow.variant_image_url && (
-                      <div className="mt-2 flex items-center justify-between text-[11px] font-mono text-slate-400 bg-slate-900 px-2.5 py-1.5 rounded-lg border border-slate-800">
-                        <span className="truncate max-w-[240px]">{detailModalRow.variant_image_url}</span>
-                        <div className="flex items-center space-x-1 shrink-0">
+                    {/* Actions & Alternatives for Product Image */}
+                    <div className="space-y-3 pt-3 border-t border-slate-800/80">
+                      <div className="flex gap-2">
+                        <button
+                          onClick={(e) => handleCycleImage(detailModalRow.row_index, 'product', e)}
+                          disabled={cyclingKey === `${detailModalRow.row_index}-product`}
+                          className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs py-2.5 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 shadow-md active:scale-95"
+                        >
+                          <RotateCw className={`w-3.5 h-3.5 ${cyclingKey === `${detailModalRow.row_index}-product` ? 'animate-spin' : ''}`} />
+                          <span>Cycle Product Image ({detailModalRow.product_alternatives?.length || 0})</span>
+                        </button>
+                      </div>
+
+                      {/* Alternatives mini grid */}
+                      {detailModalRow.product_alternatives && detailModalRow.product_alternatives.length > 0 && (
+                        <div>
+                          <div className="text-[10px] text-slate-400 mb-2 font-semibold">
+                            Click to select alternative:
+                          </div>
+                          <div className="grid grid-cols-4 gap-2">
+                            {detailModalRow.product_alternatives.slice(0, 4).map((alt, idx) => (
+                              <div
+                                key={idx}
+                                onClick={() => handleSelectAlternativeImage(detailModalRow.row_index, alt, 'product')}
+                                className="h-16 rounded-lg bg-slate-900 border border-slate-800 hover:border-indigo-400 overflow-hidden cursor-pointer p-1 flex items-center justify-center transition hover:scale-105"
+                                title={alt.title}
+                              >
+                                <img src={alt.thumbnail_src || alt.img_src} alt="alt" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* 2. VARIANT IMAGE CARD (WITH SIZE) */}
+                  <div className="bg-slate-950 p-4 sm:p-5 rounded-2xl border border-cyan-500/30 flex flex-col justify-between space-y-4 shadow-lg">
+                    <div>
+                      <div className="flex items-center justify-between pb-3 border-b border-slate-800/80">
+                        <div>
+                          <h4 className="text-xs font-bold text-cyan-300 uppercase tracking-wide flex items-center space-x-1.5">
+                            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                            <span>Variant Image (With Size)</span>
+                          </h4>
+                        </div>
+                        <span className="text-[10px] bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 px-2.5 py-0.5 rounded-full font-mono font-bold">
+                          Exact Size Pack
+                        </span>
+                      </div>
+
+                      {/* Full Query Box (No Truncation) */}
+                      <div className="mt-3">
+                        <span className="text-[10px] font-semibold text-cyan-400 uppercase tracking-wider block mb-1">
+                          Variant Search Query:
+                        </span>
+                        <div className="text-[11px] font-mono text-slate-300 bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-800 flex items-center justify-between select-text break-words">
+                          <span className="break-all">{detailModalRow.variant_query}</span>
                           <button
-                            onClick={(e) => copyToClipboard(detailModalRow.variant_image_url, e)}
-                            className="p-1 hover:text-white cursor-pointer"
-                            title="Copy link"
+                            onClick={(e) => copyToClipboard(detailModalRow.variant_query, e)}
+                            className="p-1 hover:text-white text-slate-400 ml-2 shrink-0 cursor-pointer"
+                            title="Copy query"
                           >
-                            {copiedUrl === detailModalRow.variant_image_url ? (
+                            {copiedUrl === detailModalRow.variant_query ? (
                               <Check className="w-3.5 h-3.5 text-emerald-400" />
                             ) : (
                               <Copy className="w-3.5 h-3.5" />
                             )}
                           </button>
-                          <a
-                            href={detailModalRow.variant_image_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="p-1 hover:text-white cursor-pointer"
-                            title="Open full size"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
                         </div>
                       </div>
-                    )}
-                  </div>
 
-                  {/* Actions & Alternatives for Variant Image */}
-                  <div className="space-y-3 pt-2 border-t border-slate-800">
-                    <div className="flex gap-2">
-                      <button
-                        onClick={(e) => handleCycleImage(detailModalRow.row_index, 'variant', e)}
-                        disabled={cyclingKey === `${detailModalRow.row_index}-variant`}
-                        className="flex-1 bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs py-2 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 shadow-md active:scale-95"
-                      >
-                        <RotateCw className={`w-3.5 h-3.5 ${cyclingKey === `${detailModalRow.row_index}-variant` ? 'animate-spin' : ''}`} />
-                        <span>Cycle Variant Image ({detailModalRow.variant_alternatives?.length || 0})</span>
-                      </button>
-                    </div>
+                      {/* Preview Image */}
+                      <div className="w-full h-64 bg-slate-900/60 rounded-xl mt-3 overflow-hidden flex items-center justify-center p-3 relative group border border-slate-800/60">
+                        {detailModalRow.variant_image_url ? (
+                          <img
+                            src={detailModalRow.variant_image_url}
+                            alt="Variant"
+                            loading="lazy"
+                            decoding="async"
+                            className="max-h-full max-w-full object-contain hover:scale-105 transition duration-200"
+                          />
+                        ) : (
+                          <div className="flex flex-col items-center justify-center text-slate-600">
+                            <ImageIcon className="w-12 h-12 mb-2" />
+                            <span className="text-xs">No Variant Image Found</span>
+                          </div>
+                        )}
+                      </div>
 
-                    {/* Alternatives mini grid */}
-                    {detailModalRow.variant_alternatives && detailModalRow.variant_alternatives.length > 0 && (
-                      <div>
-                        <div className="text-[10px] text-slate-400 mb-1.5 font-semibold">
-                          Click to select alternative:
-                        </div>
-                        <div className="grid grid-cols-4 gap-2">
-                          {detailModalRow.variant_alternatives.slice(0, 4).map((alt, idx) => (
-                            <div
-                              key={idx}
-                              onClick={() => handleSelectAlternativeImage(detailModalRow.row_index, alt, 'variant')}
-                              className="h-16 rounded-lg bg-slate-900 border border-slate-800 hover:border-cyan-400 overflow-hidden cursor-pointer p-1 flex items-center justify-center transition hover:scale-105"
-                              title={alt.title}
+                      {/* URL bar */}
+                      {detailModalRow.variant_image_url && (
+                        <div className="mt-2.5 flex items-center justify-between text-[11px] font-mono text-slate-400 bg-slate-900 px-3 py-2 rounded-xl border border-slate-800">
+                          <span className="truncate max-w-[280px] select-text">{detailModalRow.variant_image_url}</span>
+                          <div className="flex items-center space-x-1 shrink-0 ml-2">
+                            <button
+                              onClick={(e) => copyToClipboard(detailModalRow.variant_image_url, e)}
+                              className="p-1.5 hover:text-white text-slate-400 cursor-pointer rounded-lg hover:bg-slate-800"
+                              title="Copy link"
                             >
-                              <img src={alt.thumbnail_src || alt.img_src} alt="alt" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
-                            </div>
-                          ))}
+                              {copiedUrl === detailModalRow.variant_image_url ? (
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                            <a
+                              href={detailModalRow.variant_image_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="p-1.5 hover:text-white text-slate-400 cursor-pointer rounded-lg hover:bg-slate-800"
+                              title="Open full size"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Actions & Alternatives for Variant Image */}
+                    <div className="space-y-3 pt-3 border-t border-slate-800/80">
+                      <div className="flex gap-2">
+                        <button
+                          onClick={(e) => handleCycleImage(detailModalRow.row_index, 'variant', e)}
+                          disabled={cyclingKey === `${detailModalRow.row_index}-variant`}
+                          className="flex-1 bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs py-2.5 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 shadow-md active:scale-95"
+                        >
+                          <RotateCw className={`w-3.5 h-3.5 ${cyclingKey === `${detailModalRow.row_index}-variant` ? 'animate-spin' : ''}`} />
+                          <span>Cycle Variant Image ({detailModalRow.variant_alternatives?.length || 0})</span>
+                        </button>
+                      </div>
+
+                      {/* Alternatives mini grid */}
+                      {detailModalRow.variant_alternatives && detailModalRow.variant_alternatives.length > 0 && (
+                        <div>
+                          <div className="text-[10px] text-slate-400 mb-2 font-semibold">
+                            Click to select alternative:
+                          </div>
+                          <div className="grid grid-cols-4 gap-2">
+                            {detailModalRow.variant_alternatives.slice(0, 4).map((alt, idx) => (
+                              <div
+                                key={idx}
+                                onClick={() => handleSelectAlternativeImage(detailModalRow.row_index, alt, 'variant')}
+                                className="h-16 rounded-lg bg-slate-900 border border-slate-800 hover:border-cyan-400 overflow-hidden cursor-pointer p-1 flex items-center justify-center transition hover:scale-105"
+                                title={alt.title}
+                              >
+                                <img src={alt.thumbnail_src || alt.img_src} alt="alt" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                </div>
+
+                {/* Clean Product Metadata (Only Shows Non-Empty Fields from Excel) */}
+                {populatedFields.length > 0 && (
+                  <div className="bg-slate-950 p-4 sm:p-5 rounded-2xl border border-slate-800 space-y-3 text-xs shadow-lg">
+                    <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                      <h4 className="font-bold text-white text-xs uppercase tracking-wider flex items-center space-x-2">
+                        <Database className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Product Excel Metadata</span>
+                      </h4>
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        {populatedFields.length} attributes populated
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 pt-1">
+                      {populatedFields.map((field, idx) => (
+                        <div key={idx} className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800/70">
+                          <span className="text-slate-400 block text-[10px] font-medium uppercase tracking-wider">
+                            {field.label}
+                          </span>
+                          <span className={`font-mono text-xs mt-0.5 block truncate select-text ${
+                            field.isPrice ? 'text-emerald-400 font-bold' : 
+                            field.isSize ? 'text-cyan-300 font-semibold' : 
+                            field.isPrimary ? 'text-indigo-300 font-semibold' : 'text-slate-200'
+                          }`}>
+                            {field.value}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {orig.product_attributes && (
+                      <div className="pt-2 border-t border-slate-800/80">
+                        <span className="text-slate-400 block text-[10px] mb-1 font-semibold uppercase tracking-wider">
+                          Product Attributes:
+                        </span>
+                        <div className="text-[11px] text-slate-300 font-mono bg-slate-900/90 px-3 py-2 rounded-xl border border-slate-800 select-text break-words">
+                          {orig.product_attributes}
                         </div>
                       </div>
                     )}
-                  </div>
-                </div>
-
-              </div>
-
-              {/* Product Specifications & Full Attributes */}
-              <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-3 text-xs">
-                <h4 className="font-bold text-white text-xs uppercase tracking-wide">Product Metadata</h4>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                  <div>
-                    <span className="text-slate-400 block text-[10px]">SKU:</span>
-                    <span className="font-mono text-slate-200">{detailModalRow.original_data?.sku || '—'}</span>
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block text-[10px]">Barcode:</span>
-                    <span className="font-mono text-slate-200">{detailModalRow.original_data?.barcode || '—'}</span>
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block text-[10px]">MRP:</span>
-                    <span className="font-mono text-emerald-400 font-bold">{detailModalRow.original_data?.mrp || '—'}</span>
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block text-[10px]">Sale Price:</span>
-                    <span className="font-mono text-cyan-400 font-bold">{detailModalRow.original_data?.sale_price || '—'}</span>
-                  </div>
-                </div>
-
-                {detailModalRow.original_data?.product_attributes && (
-                  <div className="pt-2 border-t border-slate-800">
-                    <span className="text-slate-400 block text-[10px] mb-1 font-semibold">Product Attributes:</span>
-                    <div className="text-[11px] text-slate-300 font-mono bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800 break-all">
-                      {detailModalRow.original_data.product_attributes}
-                    </div>
                   </div>
                 )}
-              </div>
 
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-950/80 px-6 py-4 text-center text-xs text-slate-500 font-mono">

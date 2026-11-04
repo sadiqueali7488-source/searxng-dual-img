@@ -240,9 +240,9 @@ class SearchJob:
             language = self.config.language if self.config else "auto"
 
             orig = row.original_data or {}
-            brand_val = orig.get("brand_name") or orig.get("brand") or ""
-            prod_val = orig.get("product_name") or ""
-            var_val = orig.get("variant_label") or orig.get("variant") or ""
+            brand_val = orig.get("brand_name") or orig.get("brand") or orig.get("Brand") or orig.get("BRAND") or orig.get("Brand Name") or orig.get("Manufacturer") or ""
+            prod_val = orig.get("product_name") or orig.get("Product Name") or orig.get("product") or orig.get("Product") or ""
+            var_val = orig.get("variant_label") or orig.get("variant") or orig.get("Variant") or orig.get("size") or orig.get("Size") or orig.get("pack_size") or orig.get("Pack Size") or orig.get("PACK SIZE") or orig.get("weight") or orig.get("Weight") or ""
 
             # 1. Search Product Image (Without Size)
             if target in ["both", "product"]:
@@ -358,8 +358,29 @@ class JobManager:
             }
 
             prod_name = clean_original_data.get(config.query_column, "").strip()
-            brand = clean_brand(clean_original_data.get("brand_name") or clean_original_data.get("brand"), prod_name)
-            variant = clean_original_data.get("variant_label") or clean_original_data.get("variant", "").strip()
+            brand = (
+                clean_original_data.get("brand_name") or
+                clean_original_data.get("brand") or
+                clean_original_data.get("Brand") or
+                clean_original_data.get("BRAND") or
+                clean_original_data.get("Brand Name") or
+                clean_original_data.get("brand name") or
+                clean_original_data.get("Manufacturer") or ""
+            ).strip()
+            brand = clean_brand(brand, prod_name)
+
+            variant = (
+                clean_original_data.get("variant_label") or
+                clean_original_data.get("variant") or
+                clean_original_data.get("Variant") or
+                clean_original_data.get("size") or
+                clean_original_data.get("Size") or
+                clean_original_data.get("pack_size") or
+                clean_original_data.get("Pack Size") or
+                clean_original_data.get("PACK SIZE") or
+                clean_original_data.get("weight") or
+                clean_original_data.get("Weight") or ""
+            ).strip()
 
             if "brand_name" in clean_original_data:
                 clean_original_data["brand_name"] = brand
@@ -449,9 +470,9 @@ class JobManager:
                         await asyncio.sleep(config.delay_ms / 1000.0)
 
                     orig_row = row_res.original_data or {}
-                    b_val = orig_row.get("brand_name") or orig_row.get("brand") or ""
-                    p_val = orig_row.get("product_name") or ""
-                    v_val = orig_row.get("variant_label") or orig_row.get("variant") or ""
+                    b_val = orig_row.get("brand_name") or orig_row.get("brand") or orig_row.get("Brand") or orig_row.get("BRAND") or orig_row.get("Brand Name") or orig_row.get("Manufacturer") or ""
+                    p_val = orig_row.get("product_name") or orig_row.get("Product Name") or orig_row.get("product") or orig_row.get("Product") or ""
+                    v_val = orig_row.get("variant_label") or orig_row.get("variant") or orig_row.get("Variant") or orig_row.get("size") or orig_row.get("Size") or orig_row.get("pack_size") or orig_row.get("Pack Size") or orig_row.get("PACK SIZE") or orig_row.get("weight") or orig_row.get("Weight") or ""
 
                     # 1. Search Product Image (Without Size)
                     res_p = await search_searxng_image(
