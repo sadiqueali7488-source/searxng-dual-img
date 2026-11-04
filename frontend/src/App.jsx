@@ -121,6 +121,16 @@ const TableRow = React.memo(function TableRow({
         <div className="text-[10px] text-cyan-400 font-mono mt-0.5 truncate max-w-[240px]">
           🔸 With size: {row.variant_query}
         </div>
+        {(row.product_confidence || row.variant_confidence) && (
+          <div className="text-[10px] font-mono mt-1 flex gap-2">
+            <span className={row.product_confidence === 'HIGH' ? 'text-emerald-400' : row.product_confidence === 'LOW' ? 'text-rose-400' : 'text-amber-400'}>
+              P: {row.product_confidence || '—'}{row.product_source === 'VARIANT_IMAGE' ? ' (from variant)' : ''}
+            </span>
+            <span className={row.variant_confidence === 'HIGH' ? 'text-emerald-400' : row.variant_confidence === 'LOW' ? 'text-rose-400' : 'text-amber-400'}>
+              V: {row.variant_confidence || '—'}{row.variant_source === 'PRODUCT_IMAGE' ? ' (from product)' : ''}
+            </span>
+          </div>
+        )}
       </td>
 
       {/* Status */}

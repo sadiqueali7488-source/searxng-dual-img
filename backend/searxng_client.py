@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import httpx
 import numpy as np
 from PIL import Image
@@ -22,7 +22,26 @@ except Exception as e:
     run_ocr_full = None
 
 # OCR text and search results are cached on disk (cache_store) so nothing is done twice
+import os
 import cache_store
+try:
+    import vision_engine
+except Exception as e:  # torch / open_clip missing: the pipeline still runs on OCR rules alone
+    logger.warning(f"Vision engine unavailable: {e}")
+    vision_engine = None
+VISION_CACHE_VERSION = "v1"
+# Calibrated on real candidates (OpenCLIP ViT-B-32): back panel 0.85, 2-pack 0.86, "pouch OR bottle" 0.95,
+# crop 0.83, banner 0.58 ("multiple") vs real fronts 0.83-0.94 front_single.
+# "lifestyle" is NOT a reject kind: packs with a food photo printed on them score high on it.
+VISION_REJECT_KINDS = ["back_panel", "multiple", "banner", "crop"]
+VISION_REJECT_PROB = 0.5
+# Image <-> "a photo of <product> product package": right product 0.36-0.45, a different product 0.24
+VISION_MIN_MATCH = 0.27
+# Embedding similarity: same photo 1.0, same product other photo ~0.7, different products 0.42-0.48
+SAME_PHOTO_SIMILARITY = 0.92
+SAME_PACK_SIMILARITY = 0.6
+# Max candidates screened (fast OCR + vision) per search attempt
+MAX_SCREENED = 12
 
 # Images OCR'd at the same time per search (the OCR pool runs them in parallel)
 OCR_BATCH = 4
@@ -71,13 +90,15 @@ def is_banner_or_composite(words: List[str], brand: str = "") -> bool:
 
 # Part of every search-cache key: bump it whenever the selection rules change, so results chosen
 # under older (weaker) rules are never served from the cache again
-SEARCH_RULES_VERSION = "rules-5"
+SEARCH_RULES_VERSION = "rules-8"
 # Part of every OCR-cache key: bump when ocr_engine returns new fields
-OCR_CACHE_VERSION = "v2"
+OCR_CACHE_VERSION = "v3"
 
 # Recently downloaded images, so the strict second OCR pass does not download them again
 _IMAGE_BYTES: "Dict[str, bytes]" = {}
 _IMAGE_BYTES_MAX = 400
+# image URL -> the link that actually downloaded (the URL itself, or its search thumbnail if the full link is dead)
+_WORKING_SRC: "Dict[str, str]" = {}
 
 # Image CDNs often block non-browser clients; without this many downloads (and so OCR) fail.
 BROWSER_HEADERS = {
@@ -120,10 +141,18 @@ def normalize_url(url: Optional[str]) -> str:
     url = url.strip()
     if url.startswith("//"):
         url = "https:" + url
-    # BigBasket: replace secondary image indices (_2-, _3-, _4-) with primary front packshot (_1-)
-    if 'bbassets' in url.lower() or 'bigbasket.com/media/uploads/p/' in url.lower():
-        url = re.sub(r'(\d+)_[2-9]-', r'\g<1>_1-', url)
     return url
+
+def bigbasket_primary(url: str) -> str:
+    """
+    BigBasket numbers a product's photos _1, _2 ...; _1 is usually the front. Returns the _1 URL to try
+    FIRST as an extra candidate, or "" if not a BigBasket secondary photo. Never a blind rewrite: some
+    products have no _1 (404) and their front is e.g. _9, so the original stays a candidate too.
+    """
+    low = (url or "").lower()
+    if ('bbassets' in low or 'bigbasket.com/media/uploads/p/' in low) and re.search(r'\d+_[2-9]-', low):
+        return re.sub(r'(\d+)_[2-9]-', r'\g<1>_1-', url)
+    return ""
 
 def sanitize_search_query(text: str) -> str:
     """Removes special characters that break or confuse image search engines."""
@@ -161,27 +190,73 @@ async def read_image(client: httpx.AsyncClient, img_url: str, fallback_url: str 
     if isinstance(cached, dict):
         return cached
 
+    # "src" records which link actually downloaded: the result must only ever contain working links
+    working = img_url
     content = _IMAGE_BYTES.get(img_url)
     if content is None:
         content = await _download_image(client, img_url, timeout)
         if content is None and fallback_url and fallback_url != img_url:
             content = await _download_image(client, fallback_url, timeout)
+            working = fallback_url
         if content is None:
             return empty
         if len(_IMAGE_BYTES) >= _IMAGE_BYTES_MAX:
             _IMAGE_BYTES.pop(next(iter(_IMAGE_BYTES)))
         _IMAGE_BYTES[img_url] = content
+        _WORKING_SRC[img_url] = working
+    else:
+        working = _WORKING_SRC.get(img_url, img_url)
 
     try:
         result = await run_ocr_full(content, stage)
     except Exception:
         return empty
+    result = {**result, "src": working}
     cache_store.put_ocr(key, result)
     return result
 
 async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, fallback_url: str = "", timeout: float = 6.0) -> List[str]:
     """Fast-stage OCR text of an image (see read_image)."""
     return (await read_image(client, img_url, fallback_url, "fast", timeout))["words"]
+
+async def read_vision(client: httpx.AsyncClient, img_url: str, fallback_url: str, product_text: str) -> Optional[Dict[str, Any]]:
+    """OpenCLIP image understanding (photo kind, name match, embedding). None if vision is off/unavailable."""
+    if vision_engine is None or not vision_engine.VISION_ENABLED or not img_url:
+        return None
+    key = f"vision:{VISION_CACHE_VERSION}:{img_url}|{product_text.lower()}"
+    cached = cache_store.get_ocr(key)
+    if isinstance(cached, dict):
+        return cached
+    content = _IMAGE_BYTES.get(img_url)
+    if content is None:
+        content = await _download_image(client, img_url, 6.0)
+        if content is None and fallback_url:
+            content = await _download_image(client, fallback_url, 6.0)
+        if content is None:
+            return None
+    result = await vision_engine.analyze(content, product_text)
+    if result:
+        cache_store.put_ocr(key, result)
+    return result
+
+# Several SearXNG instances (comma separated, or SEARXNG_URLS env in Docker): searches are spread over them
+_rr_counter = [0]
+
+def pick_searxng(base_url: str) -> str:
+    env = os.environ.get("SEARXNG_URLS", "").strip()
+    urls = [u.strip().rstrip("/") for u in (env or base_url or "").split(",") if u.strip()]
+    if not urls:
+        return (base_url or "http://localhost:8888").rstrip("/")
+    _rr_counter[0] = (_rr_counter[0] + 1) % len(urls)
+    return urls[_rr_counter[0]]
+
+# Stores with clean official packshots, searched first ("site:" filter) before the open web
+TRUSTED_STORE_SITES = ["bigbasket.com", "amazon.in", "blinkit.com", "flipkart.com", "swiggy.com", "dmart.in"]
+TRUSTED_IMAGE_HOSTS = ["bbassets.com", "bigbasket.com", "media-amazon.com", "grofers.com", "blinkit",
+                       "rukminim", "flixcart.com", "swiggy.com", "dmart.in"]
+
+def trusted_query(plain_q: str) -> str:
+    return f"{plain_q} " + " OR ".join(f"site:{s}" for s in TRUSTED_STORE_SITES)
 
 def _brand_tokens(brand: str) -> List[str]:
     return [t for t in re.split(r'[\s\-_,()/&.]+', (brand or "").lower()) if t]
@@ -211,6 +286,27 @@ def brand_on_pack(words: List[str], brand: str) -> bool:
     # "bb Royal": 'royal' is a generic word elsewhere, but it is still this brand's main word
     main = max(distinctive or long_tokens, key=len, default="")
     return bool(main) and main in compact
+
+def product_on_pack(words: List[str], brand: str, product_name: str) -> bool:
+    """
+    At least one distinctive product word is PRINTED on the pack (not only in the shop's title).
+    Shops mislabel listings: a "Aashirvaad Besan" listing showing a pack that reads "Bansi Rava" is wrong.
+    Names with no distinctive word (e.g. "Saffola Gold Oil") pass.
+    """
+    if not words or not product_name:
+        return True
+    compact = re.sub(r'[^a-z0-9]', '', " ".join(words).lower())
+    brand_toks = set(_brand_tokens(brand))
+    tokens = [t for t in re.split(r'[\s\-_,()/&]+', product_name.lower())
+              if len(t) >= 4 and t not in brand_toks and t not in GENERIC_BRAND_WORDS and not re.match(r'^\d', t)]
+    if not tokens:
+        return True
+    # local / English names of the same grain count ("khapli" pack may say "emmer")
+    expanded = set(tokens)
+    for group in GRAIN_ALIAS_GROUPS:
+        if any(t in group for t in tokens):
+            expanded.update(re.sub(r'[^a-z0-9]', '', a) for a in group)
+    return any(t in compact for t in expanded)
 
 def ocr_repeats_multipack(words: List[str], brand: str = "") -> bool:
     """
@@ -243,11 +339,12 @@ def ocr_repeats_multipack(words: List[str], brand: str = "") -> bool:
 VARIANT_MODIFIERS = [
     'organic', 'select', 'superior', 'mp', 'sugar release', 'sugar control', 'low gi', 'diet', 'lite',
     'sugar free', 'sugarfree', 'no added sugar', 'low fat', 'fat free', 'low sodium', 'unsalted',
-    'double toned', 'toned', 'skimmed', 'full cream', 'high fibre', 'high fiber',
+    'double toned', 'toned', 'skimmed', 'full cream',
     'millet', 'millets', 'multigrain', 'multigrains', 'multi grain', 'multi grains',
+    'tea bags', 'tea bag', 'premix', 'green tea',
 ]
 # Checked in the title only: packs often print these as claims ("rich in protein")
-TITLE_ONLY_MODIFIERS = ['protein', 'high protein', 'kids', 'baby', 'junior', 'mini', 'jumbo', 'refill', 'travel', 'sample']
+TITLE_ONLY_MODIFIERS = ['high fibre', 'high fiber', 'protein', 'high protein', 'kids', 'baby', 'junior', 'mini', 'jumbo', 'refill', 'travel', 'sample']
 
 def has_variant_conflict(title: str, words: List[str], product_name: str, brand: str = "") -> bool:
     name = f"{product_name} {brand}".lower()
@@ -388,9 +485,6 @@ def is_back_panel_or_nutrition(title: str = "", url: str = "", words: Optional[L
         if re.search(pat, u_lower):
             return True
 
-    # BigBasket secondary image check (_2-, _3-, _4- are back/side panels)
-    if 'bbassets' in u_lower and re.search(r'\d+_[2-9]-', u_lower):
-        return True
 
     # 2. Definite nutrition table phrases in OCR or Title
     direct_nutrition_phrases = [
@@ -422,7 +516,10 @@ def is_back_panel_or_nutrition(title: str = "", url: str = "", words: Optional[L
     contact_hits = sum(1 for p in [
         r'@[a-z0-9-]+\.(?:com|in|co)', r'\b1800\s*\d{3}', r'toll\s*free', r'p\.?\s*o\.?\s*box', r'feedback',
         r'complaint', r'\bpin\s*code\b', r'\b\d{3}\s?\d{3}\b.*\b(?:india|bengaluru|mumbai|delhi|kolkata|chennai)\b',
-        r'(?:batch|lot)\s*no', r'\bpkd\.?\b', r'\bmfd\.?\b', r'use\s*by', r'\bmrp\b.*incl', r'net\s*(?:weight|wt|qty|quantity)\s*[:.]'
+        r'(?:batch|lot)\s*no', r'\bpkd\.?\b', r'\bmfd\.?\b', r'use\s*by', r'\bmrp\b.*incl', r'net\s*(?:weight|wt|qty|quantity)\s*[:.]',
+        # Manufacturer / company / price block (front + back shown side by side, e.g. Aashirvaad Besan "95.00")
+        r'manuf[a-z]*\s*by', r'marketed\s*by', r'quality\s*produ[a-z]*\s*of', r'\b(?:pvt|private)\.?\s*(?:ltd|limited)\b',
+        r'\b(?:group|industries|foods?\s+products?)\b.*\b(?:ltd|limited|group)\b', r'(?<![\d.])\d{2,4}\.00(?![\d])'
     ] if re.search(p, w_lower))
     if contact_hits >= 2:
         return True
@@ -487,8 +584,13 @@ def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[
         r'\bmultipack\b',
         r'\bmulti-pack\b',
         r'\bmulti\s+pack\b',
-        r'\b[2-9]\s*packs\b'      # OCR reads "5" and "PACKS" as separate lines; they are joined with a space
+        r'\b[2-9]\s*packs\b',     # OCR reads "5" and "PACKS" as separate lines; they are joined with a space
+        r'\b[2-9]\s*[x×]\s+(?:[a-z]+\s+){0,3}\d+(?:\.\d+)?\s*(?:kg|g|gm|ml|l)\b',   # "6x detergent bar 250g"
+        r'\b[2-9]\s*[x×]\s*\d+(?:\.\d+)?\s*(?:kg|g|gm|ml|l)\b'
     ]
+    # A line that is only a count multiplier ("6x", "x6") is a multipack badge
+    if any(re.fullmatch(r'\s*(?:[2-9]\d?\s*[x×]|[x×]\s*[2-9]\d?)\s*', w or "") for w in (words or [])):
+        return True
     if any(re.search(p, combined) for p in patterns):
         return True
 
@@ -1032,7 +1134,8 @@ def score_and_rank_images(
     return [x[1] for x in scored]
 
 async def test_searxng_connection(base_url: str = "http://localhost:8888") -> Dict[str, Any]:
-    base_url = base_url.rstrip("/")
+    # In Docker the instances come from SEARXNG_URLS, not the URL typed in the UI
+    base_url = pick_searxng(base_url)
     test_endpoint = f"{base_url}/search"
     params = {
         "q": "ping",
@@ -1094,7 +1197,8 @@ async def search_searxng_image(
     safesearch: int = 0,
     time_range: str = "",
     language: str = "auto",
-    top_limit: int = 20
+    top_limit: int = 20,
+    deep: bool = False
 ) -> Dict[str, Any]:
     """
     Cached entry point:
@@ -1118,7 +1222,7 @@ async def search_searxng_image(
     if task is None:
         task = asyncio.ensure_future(_search_uncached(
             client, base_url, query, brand, product_name, variant_label,
-            is_variant, safesearch, time_range, language, top_limit
+            is_variant, safesearch, time_range, language, top_limit, deep
         ))
         _inflight[key] = task
         task.add_done_callback(lambda _t: _inflight.pop(key, None))
@@ -1151,28 +1255,35 @@ async def _search_uncached(
     safesearch: int = 0,
     time_range: str = "",
     language: str = "auto",
-    top_limit: int = 20
+    top_limit: int = 20,
+    deep: bool = False
 ) -> Dict[str, Any]:
     """
     Automatic retry ladder: stops at the first attempt that finds an EXACT image.
-      1. the query as built (e.g. "... single pack front packaging")
+      1. trusted stores (site:bigbasket.com OR site:amazon.in ...) + the query as built, merged
       2. the plain query (brand + product [+ size]): different, often better results
       3. page 2 of the plain query
+      deep=True (Retry Not Found) adds: page 3, and the size written with a space ("1 kg")
     If no attempt is exact, the best fallback (right brand + product front) from any attempt is used.
     """
     clean_q = sanitize_search_query(query)
     plain_q = _strip_suffix(clean_q) or clean_q
-    attempts = [(clean_q, 1)]
+    attempts: List[Tuple[List[str], int]] = [([trusted_query(plain_q), clean_q], 1)]
     if plain_q.lower() != clean_q.lower():
-        attempts.append((plain_q, 1))
-    attempts.append((plain_q, 2))
+        attempts.append(([plain_q], 1))
+    attempts.append(([plain_q], 2))
+    if deep:
+        attempts.append(([plain_q], 3))
+        spaced = re.sub(r'(\d)(kg|g|gm|ml|l|ltr)\b', r'\1 \2', plain_q, flags=re.I)
+        if spaced != plain_q:
+            attempts.append(([spaced], 1))
 
     seen: set = set()
     fallback_result: Optional[Dict[str, Any]] = None
     extra_alts: List[ImageResult] = []
     errors: List[str] = []
-    for q, page in attempts:
-        res = await _search_once(client, base_url, q, page, brand, product_name, variant_label,
+    for queries, page in attempts:
+        res = await _search_once(client, base_url, queries, page, brand, product_name, variant_label,
                                  is_variant, safesearch, time_range, language, top_limit, seen)
         if res["status"] == "ERROR":
             errors.append(res.get("error_message") or "error")
@@ -1198,10 +1309,43 @@ async def _search_uncached(
         "error_message": f"No verified image matching brand '{brand}' and product '{product_name}'"
     }
 
+async def _fetch_image_results(client: httpx.AsyncClient, base_url: str, q: str, page: int,
+                               language: str, time_range: str, safesearch: int) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """One SearXNG image query: Google Images first, Bing Images if Google is blocked. (results | None, error)."""
+    search_url = f"{pick_searxng(base_url)}/search"
+    params = {
+        "q": q,
+        "category_images": 1,
+        "engines": "google images",
+        "pageno": page,
+        "language": language,
+        "time_range": time_range,
+        "safesearch": safesearch,
+        "format": "json"
+    }
+    try:
+        resp_g = await client.get(search_url, params=params)
+        if resp_g.status_code == 200:
+            results = resp_g.json().get("results", [])
+            if results:
+                return results, ""
+    except Exception:
+        pass
+    # Resilient Fallback: Google Images temporarily blocked/suspended by SearXNG -> Bing Images
+    try:
+        resp_fb = await client.get(search_url, params={**params, "engines": "bing images"})
+        if resp_fb.status_code == 200:
+            return resp_fb.json().get("results", []), ""
+        return None, f"HTTP {resp_fb.status_code}: {resp_fb.text[:120]}"
+    except httpx.TimeoutException:
+        return None, "SearXNG request timed out"
+    except Exception as e:
+        return None, str(e) or type(e).__name__
+
 async def _search_once(
     client: httpx.AsyncClient,
     base_url: str,
-    clean_q: str,
+    queries: List[str],
     page: int,
     brand: str,
     product_name: str,
@@ -1226,43 +1370,28 @@ async def _search_once(
     Returns status SUCCESS / NOT_FOUND / ERROR and match 'exact' / 'fallback'.
     Candidates already inspected by an earlier attempt (`seen`) are skipped.
     """
-    base_url = base_url.rstrip("/")
-    search_url = f"{base_url}/search"
-
-    params = {
-        "q": clean_q,
-        "category_images": 1,
-        "engines": "google images",
-        "pageno": page,
-        "language": language,
-        "time_range": time_range,
-        "safesearch": safesearch,
-        "format": "json"
-    }
-
     try:
-        raw_results = []
-        try:
-            # 1. Primary: Use Google Images strictly
-            resp_g = await client.get(search_url, params=params)
-            if resp_g.status_code == 200:
-                raw_results = resp_g.json().get("results", [])
-        except Exception:
-            raw_results = []
-
-        # 2. Resilient Fallback: If Google Images is temporarily blocked/suspended by SearXNG, query bing images
-        if not raw_results:
-            fallback_params = {**params, "engines": "bing images"}
-            resp_fb = await client.get(search_url, params=fallback_params)
-            if resp_fb.status_code == 200:
-                raw_results = resp_fb.json().get("results", [])
-            else:
-                return {
-                    "status": "ERROR",
-                    "best_image": None,
-                    "alternatives": [],
-                    "error_message": f"HTTP {resp_fb.status_code}: {resp_fb.text[:120]}"
-                }
+        # All queries of this attempt run in parallel; results are merged in query order
+        # (trusted-store results first), duplicates removed
+        fetched = await asyncio.gather(*(
+            _fetch_image_results(client, base_url, q, page, language, time_range, safesearch) for q in queries
+        ))
+        raw_results: List[Dict[str, Any]] = []
+        merged_src: set = set()
+        errors = [err for res, err in fetched if res is None]
+        for res, _ in fetched:
+            for item in res or []:
+                src = item.get("img_src") or item.get("thumbnail_src")
+                if src and src not in merged_src:
+                    merged_src.add(src)
+                    raw_results.append(item)
+        if not raw_results and len(errors) == len(queries):
+            return {
+                "status": "ERROR",
+                "best_image": None,
+                "alternatives": [],
+                "error_message": errors[0]
+            }
 
         if not raw_results:
             return {
@@ -1300,6 +1429,12 @@ async def _search_once(
                 if is_blocked_source(direct_img, page_url):
                     continue
                 seen.add(direct_img)
+                # BigBasket secondary photo: try its _1 (usually the front) first; a dead link fails verification
+                primary = bigbasket_primary(direct_img)
+                if primary and primary not in seen:
+                    seen.add(primary)
+                    candidate_items.append(ImageResult(title=title, img_src=primary, thumbnail_src="",
+                                                       url=page_url, resolution="", engine=engine))
                 candidate_items.append(ImageResult(
                     title=title,
                     img_src=direct_img,
@@ -1355,6 +1490,9 @@ async def _search_once(
                 return "reject"
             if has_variant_conflict(title, words, product_name, brand):
                 return "reject"
+            # Mislabelled listings: the product's own name must be printed on the pack
+            if brand_on_pack(words, brand) and not product_on_pack(words, brand, product_name):
+                return "reject"
 
             clean = is_clean_packshot(cand_url, quality)
             if is_variant and variant_label:
@@ -1370,6 +1508,8 @@ async def _search_once(
             return "fallback"
 
         meta_ok_map: Dict[str, bool] = {}
+        # What the vision model compares each image with ("Aashirvaad Bansi Rava")
+        product_text = product_name if brand.lower() in product_name.lower() else f"{brand} {product_name}".strip()
 
         async def screen(candidate: ImageResult) -> str:
             """
@@ -1399,7 +1539,23 @@ async def _search_once(
             # Stage 1: fast OCR on the full packaging image (thumbnail only if it can't be downloaded)
             first = await read_image(client, cand_url, candidate.thumbnail_src, "fast")
             clean_shots[cand_url] = is_clean_packshot(cand_url, first["quality"])
-            return judge(candidate, first, meta_ok)
+            working_src[cand_url] = first.get("src") or ""
+            verdict = judge(candidate, first, meta_ok)
+            if verdict == "reject":
+                return "reject"
+
+            # Vision (OpenCLIP): what kind of photo is it, and is it this product at all?
+            vis = await read_vision(client, cand_url, candidate.thumbnail_src, product_text)
+            vision_map[cand_url] = vis
+            if vis:
+                kinds = vis.get("kinds", {})
+                bad_kinds = [k for k in VISION_REJECT_KINDS if not (k == "multiple" and query_is_combo)]
+                worst = max(bad_kinds, key=lambda k: kinds.get(k, 0.0))
+                if kinds.get(worst, 0.0) >= VISION_REJECT_PROB and kinds.get(worst, 0.0) > kinds.get("front_single", 0.0):
+                    return "reject"
+                if vis.get("match") is not None and vis["match"] < VISION_MIN_MATCH:
+                    return "reject"   # looks like a different product altogether
+            return verdict
 
         confirmed: Dict[int, str] = {}
 
@@ -1423,41 +1579,89 @@ async def _search_once(
             confirmed[i] = verdicts[i] = verdict
             return verdict
 
-        # Step 2: Inspection in rank order. The top-ranked image is screened alone first (it is usually
-        # right); after that OCR_BATCH candidates are screened in parallel. The first screened exact
-        # match is confirmed by the strict OCR; if it fails there, the next one is tried.
+        def is_trusted(c: ImageResult) -> bool:
+            return any(h in f"{c.img_src} {c.url}".lower() for h in TRUSTED_IMAGE_HOSTS)
+
+        def consensus(i: int) -> int:
+            """How many OTHER verified candidates are the same photo (official packshot reused by stores)."""
+            emb = (vision_map.get(candidate_items[i].img_src) or {}).get("embedding")
+            if not emb or vision_engine is None:
+                return 0
+            n = 0
+            for j, v in verdicts.items():
+                if j == i or v == "reject":
+                    continue
+                other = (vision_map.get(candidate_items[j].img_src) or {}).get("embedding")
+                sim = vision_engine.similarity(emb, other)
+                if sim is not None and sim >= SAME_PHOTO_SIMILARITY:
+                    n += 1
+            return n
+
+        def score(i: int) -> float:
+            """Ranks verified candidates: exact rules > vision front/name match > same photo on several stores > store > rank."""
+            c = candidate_items[i]
+            vis = vision_map.get(c.img_src)
+            s = (100.0 if verdicts[i] == "exact" else 0.0) + max(0, 20 - i)
+            s += 15.0 if clean_shots.get(c.img_src) else 0.0
+            s += 20.0 if is_trusted(c) else 0.0
+            if vis:
+                s += 40.0 * vis.get("kinds", {}).get("front_single", 0.0)
+                s -= 20.0 * vis.get("kinds", {}).get("lifestyle", 0.0)
+                if vis.get("match") is not None:
+                    s += 200.0 * max(0.0, vis["match"] - 0.25)
+                s += 25.0 * min(consensus(i), 3)
+            return s
+
+        def confident(i: int) -> bool:
+            """Top result that needs no comparison: exact, clean, from a store, and vision agrees."""
+            c = candidate_items[i]
+            vis = vision_map.get(c.img_src)
+            vision_ok = vis is None or (vis.get("kinds", {}).get("front_single", 0) >= 0.6 and (vis.get("match") or 0) >= 0.33)
+            return verdicts.get(i) == "exact" and clean_shots.get(c.img_src, False) and is_trusted(c) and vision_ok
+
+        # Step 2: Screening in rank order: the top image alone first, then OCR_BATCH in parallel.
+        # Screening stops once there are enough verified candidates to compare (or an obviously
+        # perfect top result); then the best-scoring candidate must also pass the strict OCR.
         verdicts: Dict[int, str] = {}
         clean_shots: Dict[str, bool] = {}
+        vision_map: Dict[str, Any] = {}
+        working_src: Dict[str, str] = {}
         selected_index = -1
         match = "exact"
         start = 0
-        while start < len(candidate_items) and selected_index == -1:
+        while start < len(candidate_items) and start < MAX_SCREENED:
             size = 1 if start == 0 else OCR_BATCH
             batch = list(range(start, min(start + size, len(candidate_items))))
             results = await asyncio.gather(*(screen(candidate_items[i]) for i in batch))
             verdicts.update(zip(batch, results))
-            for i in batch:
-                if verdicts[i] == "exact" and await confirm(i) == "exact":
-                    selected_index = i
-                    break
+            exact_found = [i for i, v in verdicts.items() if v == "exact"]
+            if start == 0 and exact_found and confident(exact_found[0]):
+                break
+            if len(exact_found) >= 2:
+                break
             start += size
 
-        if selected_index == -1:
-            # No exact match: best fallback in rank order, still confirmed by the strict OCR
-            for i in sorted(verdicts):
-                if verdicts[i] == "fallback":
-                    v = await confirm(i)
-                    if v != "reject":
-                        selected_index, match = i, v
-                        break
+        for kind in ("exact", "fallback"):
+            for i in sorted((i for i, v in verdicts.items() if v == kind), key=score, reverse=True):
+                v = await confirm(i)
+                if v == "exact" or (kind == "fallback" and v == "fallback"):
+                    selected_index, match = i, v
+                    break
+            if selected_index != -1:
+                break
 
-        # Alternatives never include rejected images (back panels, multi-packs, wrong products)
+        # Alternatives never include rejected images (back panels, multi-packs, wrong products);
+        # verified ones come first, best score first
         rank = {"exact": 0, "fallback": 1}
         alt_order = sorted(
             (i for i in range(len(candidate_items)) if i != selected_index and verdicts.get(i) != "reject"),
-            key=lambda i: (rank.get(verdicts.get(i, ""), 2), i)
+            key=lambda i: (rank.get(verdicts.get(i, ""), 2), -score(i) if i in verdicts else i)
         )
         alternatives = [candidate_items[i] for i in alt_order][:MAX_ALTERNATIVES]
+        alt_embeddings = {
+            candidate_items[i].img_src: (vision_map.get(candidate_items[i].img_src) or {}).get("embedding")
+            for i in alt_order[:MAX_ALTERNATIVES] if (vision_map.get(candidate_items[i].img_src) or {}).get("embedding")
+        }
 
         # If still no candidate matches both brand and product, return NOT_FOUND (Zero false positives!)
         if selected_index == -1:
@@ -1468,12 +1672,29 @@ async def _search_once(
                 "error_message": f"No verified image matching brand '{brand}' and product '{product_name}'"
             }
 
+        chosen = candidate_items[selected_index]
+        vis = vision_map.get(chosen.img_src)
+        clean = clean_shots.get(chosen.img_src, False)
+        # VERIFIED LINK ONLY: if the full-size link was dead and only the thumbnail downloaded, use the thumbnail
+        src = working_src.get(chosen.img_src)
+        if src and src != chosen.img_src:
+            chosen = chosen.model_copy(update={"img_src": src, "thumbnail_src": src})
+        vision_ok = vis is None or (vis.get("kinds", {}).get("front_single", 0) >= 0.5 and (vis.get("match") or 0) >= 0.3)
+        if match == "exact" and clean and vision_ok:
+            confidence = "HIGH"
+        elif match == "exact" or (clean and vision_ok):
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
         return {
             "status": "SUCCESS",
-            "best_image": candidate_items[selected_index],
+            "best_image": chosen,
             "alternatives": alternatives,
             "match": match,
-            "clean": clean_shots.get(candidate_items[selected_index].img_src, False),
+            "clean": clean,
+            "confidence": confidence,
+            "embedding": (vis or {}).get("embedding"),
+            "alt_embeddings": alt_embeddings,
             "error_message": None
         }
 

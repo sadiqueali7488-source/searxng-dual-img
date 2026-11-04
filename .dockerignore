@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+**/*.pyc
+backend/cache
+backend/server.log*
+frontend/node_modules
+frontend/dist
+frontend/vite.log
+sample_data/result_*

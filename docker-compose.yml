@@ -1,0 +1,40 @@
+# Product Image Finder: app + 3 SearXNG instances, all in Docker.
+#   docker compose up -d --build        -> http://localhost:8000
+# First start downloads the OCR (PP-OCRv6) and vision (OpenCLIP) models into the "models" volume (~1 GB).
+name: image-finder
+
+x-searxng: &searxng
+  image: searxng/searxng:latest
+  restart: unless-stopped
+  environment:
+    GRANIAN_WORKERS: "4"
+    GRANIAN_BLOCKING_THREADS: "8"
+  volumes:
+    - ./searxng_settings.yml:/etc/searxng/settings.yml:ro
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Searches are spread over all instances (more parallel capacity; they share this machine's IP)
+      SEARXNG_URLS: "http://searxng-1:8080,http://searxng-2:8080,http://searxng-3:8080"
+      OCR_THREADS_PER_ENGINE: "4"
+      VISION_ENABLED: "1"
+    volumes:
+      - app-cache:/app/backend/cache     # search/OCR cache + job store (jobs resume after a restart)
+      - models:/models                   # PP-OCRv6 + OpenCLIP weights, downloaded once
+    depends_on:
+      - searxng-1
+      - searxng-2
+      - searxng-3
+
+  searxng-1: *searxng
+  searxng-2: *searxng
+  searxng-3: *searxng
+
+volumes:
+  app-cache:
+  models:

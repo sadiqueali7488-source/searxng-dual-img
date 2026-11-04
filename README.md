@@ -41,6 +41,26 @@ This starts the backend and automatically opens the dashboard in your default br
 
 ---
 
+## 🐳 Docker (recommended: app + 3 SearXNG instances)
+
+```bash
+docker compose up -d --build
+```
+Open **`http://localhost:8000`**. The first start downloads the PP-OCRv6 and OpenCLIP models (~1 GB) into the `models` volume; later starts are instant.
+
+- **Jobs survive restarts**: every finished row is saved (`app-cache` volume); a running job continues after `docker compose restart`.
+- **Search capacity**: searches are spread over `searxng-1..3` (`SEARXNG_URLS`). They share this machine's IP, so they add parallel capacity, not protection from engine rate limits.
+- **Tuning** (environment of `app`): `OCR_THREADS_PER_ENGINE`, `OCR_WORKERS`, `STRICT_OCR_WORKERS`, `VISION_ENABLED=0` (switch vision off), `OCR_MODEL` / `STRICT_OCR_MODEL` (`tiny|small|medium`).
+
+### How an image is chosen
+1. Search: trusted stores first (`site:bigbasket.com OR site:amazon.in ...`) merged with the open web; automatic retries (plain query, page 2; Retry Not Found adds page 3 and spaced sizes).
+2. Every candidate is downloaded (dead links are never used) and checked by **PP-OCRv6** (brand, product, exact size, back panel, multi-pack text) and **OpenCLIP** (single front pack vs back / several packs / banner / crop, and whether it looks like this product).
+3. The best candidate (rules + vision + same official photo on several stores + trusted store) must also pass a **second, stricter OCR**.
+4. Product and variant images must show the same pack; if the variant (with size) isn't found, the product image is used and flagged.
+5. Export adds `product_image_confidence` / `variant_image_confidence` (HIGH / MEDIUM / LOW) and `*_image_source` (EXACT / PRODUCT_IMAGE / VARIANT_IMAGE). Check the LOW rows.
+
+---
+
 ## 🛠️ Manual Startup
 
 ### 1. Backend (FastAPI)

@@ -45,6 +45,13 @@ class RowResult(BaseModel):
     variant_engine: str = ""
     variant_alternatives: List[ImageResult] = Field(default_factory=list)
 
+    # Quality of the picked images: HIGH / MEDIUM / LOW ("" until searched)
+    product_confidence: str = ""
+    variant_confidence: str = ""
+    # Where the image came from: "" (own search), "VARIANT_IMAGE" / "PRODUCT_IMAGE" (borrowed from the other search)
+    product_source: str = ""
+    variant_source: str = ""
+
     # Backward compatibility helpers
     query: str = ""
     status: str = "PENDING"  # PENDING, SEARCHING, SUCCESS, PARTIAL, NOT_FOUND, ERROR
