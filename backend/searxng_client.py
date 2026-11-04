@@ -27,7 +27,10 @@ def normalize_url(url: Optional[str]) -> str:
         return ""
     url = url.strip()
     if url.startswith("//"):
-        return "https:" + url
+        url = "https:" + url
+    # BigBasket: replace secondary image indices (_2-, _3-, _4-) with primary front packshot (_1-)
+    if 'bbassets' in url.lower():
+        url = re.sub(r'(\d+)_[2-9]-', r'\g<1>_1-', url)
     return url
 
 def sanitize_search_query(text: str) -> str:
@@ -94,6 +97,84 @@ def has_specialty_flour_conflict(target_prod: str, cand_text: str) -> bool:
             return True
     return False
 
+MILLET_GROUPS = {
+    'bajra': ['bajra', 'pearl millet', 'pearlmillet', 'sajjalu', 'kambu'],
+    'foxtail': ['foxtail', 'kangni', 'kakum', 'korra', 'tenai'],
+    'ragi': ['ragi', 'finger millet', 'fingermillet', 'mandua', 'nachni', 'kezhvaragu'],
+    'jowar': ['jowar', 'sorghum', 'cholam', 'jola'],
+    'kodo': ['kodo', 'kodra', 'varagu', 'arika'],
+    'little': ['little millet', 'kutki', 'sama', 'samai'],
+    'barnyard': ['barnyard', 'sanwa', 'samak', 'kuthiraivali'],
+    'proso': ['proso', 'chena', 'barri', 'panivaragu']
+}
+
+BACK_PANEL_URL_PATTERNS = [
+    r'[-_]back\b', r'/back/', r'[-_]bk\b', r'[-_]b\.(?:jpg|jpeg|png|webp)',
+    r'nutrition', r'ingredient', r'backpanel', r'back-panel', r'back_panel',
+    r'barcode', r'facts[-_]panel', r'[-_]pt0[1-9]', r'\.pt0[1-9]\.'
+]
+
+BACK_PANEL_KEYWORDS = [
+    'nutritional information', 'nutrition facts', 'nutritional facts', 'nutrition table',
+    'nutritional values', 'nutritional value', 'typical values', 'approximate values',
+    'per 100g', 'per 100 g', 'serving size', 'servings per container', 'servings per pack',
+    'energy (kcal)', 'energy kcal', 'dietary fiber', 'dietary fibre',
+    'saturated fat', 'trans fat', 'added sugars', 'added sugar',
+    'lic. no.', 'lic no.', 'lic no', 'licence no', 'license no', 'fssai lic',
+    'manufactured by', 'mfd. by', 'mfd by', 'mfg. by', 'mfg by', 'packed by', 'pkd. by', 'pkd by',
+    'marketed by', 'consumer care', 'customer care', 'feedback/queries',
+    'store in a cool', 'keep in an airtight', 'batch no', 'lot no', 'mfg date', 'exp date', 'best before'
+]
+
+def is_back_panel_or_nutrition(title: str = "", url: str = "", words: Optional[List[str]] = None) -> bool:
+    """
+    Strictly detects if an image shows a back panel, nutrition table, ingredients list, or regulatory label.
+    Front packshots must be clean single packaging shots, never back panels or nutrition tables.
+    """
+    t_lower = (title or "").lower()
+    u_lower = (url or "").lower()
+    w_lower = " ".join(words or []).lower()
+    combined = f"{t_lower} {u_lower} {w_lower}"
+
+    # 1. Obvious URL markers
+    for pat in BACK_PANEL_URL_PATTERNS:
+        if re.search(pat, u_lower):
+            return True
+
+    # BigBasket secondary image check (_2-, _3-, _4- are back/side panels)
+    if 'bbassets' in u_lower and re.search(r'\d+_[2-9]-', u_lower):
+        return True
+
+    # 2. Definite nutrition table phrases in OCR or Title
+    direct_nutrition_phrases = [
+        'nutritional information', 'nutrition facts', 'nutritional facts',
+        'nutrition table', 'nutritional values', 'typical values', 'approximate values',
+        'per 100g', 'per 100 g', 'serving size', 'servings per container', 'servings per pack'
+    ]
+    if any(p in combined for p in direct_nutrition_phrases):
+        return True
+
+    # 3. Macro nutrients cluster (Energy kcal / carbohydrate / protein / fat / fiber)
+    has_energy = 'energy' in combined or 'kcal' in combined
+    has_macros = any(m in combined for m in ['carbohydrate', 'protein', 'fat', 'sugar', 'fiber', 'fibre', 'cholesterol', 'sodium'])
+    if has_energy and has_macros:
+        return True
+
+    # 4. Regulatory & Manufacturer Back-panel Cluster
+    has_regulatory = any(r in combined for r in ['lic. no', 'lic no', 'licence no', 'license no', 'fssai'])
+    has_mfg = any(m in combined for m in ['manufactured by', 'mfd by', 'mfg by', 'packed by', 'pkd by', 'marketed by', 'customer care', 'consumer care'])
+    has_ingredients = any(i in combined for i in ['ingredient:', 'ingredients:', 'ingredient :', 'ingredients :'])
+    
+    if (has_regulatory and has_mfg) or (has_regulatory and has_ingredients) or (has_mfg and has_ingredients):
+        return True
+
+    # 5. Multiple back-panel keywords
+    indicator_count = sum(1 for kw in BACK_PANEL_KEYWORDS if kw in combined)
+    if indicator_count >= 2:
+        return True
+
+    return False
+
 def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[str]] = None, resolution: str = "") -> bool:
     """Detects if candidate image shows or describes a multi-pack / twin pack / combo / brand range banner / wide collage."""
     ocr_str = " ".join(words or []).lower()
@@ -151,7 +232,7 @@ def is_candidate_multipack(title: str = "", url: str = "", words: Optional[List[
                 ratio = w / h
                 # Single packshots are square or portrait (0.55 <= ratio <= 1.50).
                 # Banners and 3-pack collages have ratio > 1.52 or < 0.50
-                if ratio > 1.52 or ratio < 0.50:
+                if ratio > 1.25 or ratio < 0.50:
                     return True
 
     return False
@@ -294,6 +375,15 @@ def is_dynamic_brand_match(full_text: str, target_brand: str, ocr_words: Optiona
     if clean_b_str in clean_comb_str:
         return True
 
+    # Brand transliteration aliases (e.g. Aahar <-> Ahaar)
+    BRAND_TRANSLITERATIONS = {
+        'aahar': 'ahaar',
+        'ahaar': 'aahar'
+    }
+    trans = BRAND_TRANSLITERATIONS.get(b_clean)
+    if trans and trans in clean_comb_str:
+        return True
+
     # 3. Tokenize brand into non-filler words
     filler_words = {'organic', 'pure', 'food', 'foods', 'brand', 'brands', 'india', 'international', 'products', 'pvts', 'ltd'}
     tokens = [t for t in re.split(r'[\s\-_]+', b_clean) if len(t) >= 2 and t not in filler_words]
@@ -303,7 +393,11 @@ def is_dynamic_brand_match(full_text: str, target_brand: str, ocr_words: Optiona
     # Single-word brand (e.g. "Aashirvaad", "Patanjali", "Amul", "Fortune", "9AM", "Catch", "Everest")
     if len(tokens) == 1:
         t = tokens[0]
-        return bool(re.search(rf'\b{re.escape(t)}\b', combined) or t in clean_comb_str)
+        trans_t = BRAND_TRANSLITERATIONS.get(t)
+        return bool(
+            re.search(rf'\b{re.escape(t)}\b', combined) or t in clean_comb_str or
+            (trans_t and (re.search(rf'\b{re.escape(trans_t)}\b', combined) or trans_t in clean_comb_str))
+        )
 
     # Multi-word brand (e.g. "bb Super Saver", "bb Royal", "Tata Sampann", "Tata Salt"):
     matched_count = 0
@@ -399,24 +493,36 @@ def verify_product_keyword_match(words: List[str], title: str, product_name: str
                     return False
 
     # 5. MILLET SPECIES LOCK:
-    millet_species = {
-        'foxtail': ['foxtail', 'kangni'],
-        'bajra': ['bajra', 'pearl millet', 'pearlmillet'],
-        'pearl': ['bajra', 'pearl millet', 'pearlmillet'],
-        'ragi': ['ragi', 'finger millet', 'fingermillet', 'mandua'],
-        'jowar': ['jowar', 'sorghum'],
-        'kodo': ['kodo', 'kodra'],
-        'little': ['little millet', 'kutki', 'sama'],
-        'barnyard': ['barnyard', 'sanwa', 'samak']
+    MILLET_GROUPS = {
+        'bajra': ['bajra', 'pearl millet', 'pearlmillet', 'sajjalu', 'kambu'],
+        'foxtail': ['foxtail', 'kangni', 'kakum', 'korra', 'tenai'],
+        'ragi': ['ragi', 'finger millet', 'fingermillet', 'mandua', 'nachni', 'kezhvaragu'],
+        'jowar': ['jowar', 'sorghum', 'cholam', 'jola'],
+        'kodo': ['kodo', 'kodra', 'varagu', 'arika'],
+        'little': ['little millet', 'kutki', 'sama', 'samai'],
+        'barnyard': ['barnyard', 'sanwa', 'samak', 'kuthiraivali'],
+        'proso': ['proso', 'chena', 'barri', 'panivaragu']
     }
-    for spec, aliases in millet_species.items():
-        if spec in p_lower:
-            if not any(a in full_text for a in aliases):
-                return False
-            for other_spec, other_aliases in millet_species.items():
-                if other_spec == spec or other_spec in p_lower:
-                    continue
-                if any(re.search(rf'\b{re.escape(oa)}\b', full_text) for oa in other_aliases):
+
+    target_millets = set()
+    for m_key, m_aliases in MILLET_GROUPS.items():
+        if any(re.search(rf'\b{re.escape(a)}\b', p_lower) for a in m_aliases):
+            target_millets.add(m_key)
+
+    if target_millets:
+        matched_target_millet = False
+        for tm in target_millets:
+            if any(a in full_text for a in MILLET_GROUPS[tm]):
+                matched_target_millet = True
+                break
+        if not matched_target_millet:
+            return False
+
+        for other_m, other_aliases in MILLET_GROUPS.items():
+            if other_m in target_millets:
+                continue
+            for oa in other_aliases:
+                if re.search(rf'\b{re.escape(oa)}\b', full_text):
                     return False
 
     # 6. FORM LOCK: Flour / Atta vs Whole Grain
@@ -509,11 +615,21 @@ def score_and_rank_images(
         if has_specialty_flour_conflict(prod_clean, combined):
             continue
 
+        # 3.2 BACK PANEL / NUTRITION LABEL FILTER
+        if is_back_panel_or_nutrition(title, f"{img_url} {page_url}"):
+            continue
+
         # 4. MILLET SPECIES CONFLICT FILTER
-        if 'foxtail' in prod_clean:
-            if any(m in combined for m in ['bajra', 'pearl millet', 'ragi', 'jowar', 'kodo']):
-                continue
-        if 'bajra' in prod_clean and any(m in combined for m in ['foxtail', 'ragi', 'jowar']):
+        cand_has_millet_conflict = False
+        for m_key, m_aliases in MILLET_GROUPS.items():
+            if any(re.search(rf'\b{re.escape(a)}\b', prod_clean) for a in m_aliases):
+                for other_m, other_aliases in MILLET_GROUPS.items():
+                    if other_m != m_key and any(re.search(rf'\b{re.escape(oa)}\b', combined) for oa in other_aliases):
+                        cand_has_millet_conflict = True
+                        break
+            if cand_has_millet_conflict:
+                break
+        if cand_has_millet_conflict:
             continue
 
         # 5. DISTINCTIVE FLAVOR / SUB-TYPE FILTER
@@ -771,6 +887,10 @@ async def search_searxng_image(
             if query_is_combo and not cand_multi:
                 continue
 
+            # Back panel & nutrition label guard (Front packaging only!)
+            if is_back_panel_or_nutrition(title, cand_url):
+                continue
+
             # Fast metadata pre-check
             if not is_dynamic_brand_match(cand_context, brand):
                 continue
@@ -780,6 +900,10 @@ async def search_searxng_image(
             # Run OCR on packaging image
             img_to_ocr = candidate.thumbnail_src or candidate.img_src
             words = await extract_image_ocr_text(client, img_to_ocr, timeout=1.5)
+
+            # Re-verify back panel with OCR words
+            if is_back_panel_or_nutrition(title, cand_url, words):
+                continue
 
             # Re-verify multi-pack with OCR text & resolution
             if not query_is_combo and is_candidate_multipack(title, cand_context, words, resolution=candidate.resolution):
@@ -813,6 +937,9 @@ async def search_searxng_image(
                     continue
 
                 words = ocr_cache.get(candidate.thumbnail_src or candidate.img_src, [])
+                if is_back_panel_or_nutrition(candidate.title, candidate.img_src, words):
+                    continue
+
                 if is_dynamic_brand_match(cand_context, brand, words) and \
                    verify_product_keyword_match(words, candidate.title, product_name, brand, cand_context):
                     selected_index = idx
