@@ -259,6 +259,11 @@ def score_and_rank_images(
         page_url = (item.get("url") or "").lower()
         combined = f"{title} {img_url} {page_url}"
 
+        # 0. STRICT BLOCKED DOMAINS (e.g. JioMart)
+        blocked_domains = ['jiomart', 'jiomart.com']
+        if any(b in combined for b in blocked_domains):
+            continue
+
         score = 0.0
 
         # 1. STRICT BRAND MATCHING
@@ -311,7 +316,7 @@ def score_and_rank_images(
         # 4. TRUSTED RETAILER BOOST
         trusted = [
             'amazon', 'flipkart', 'bigbasket', 'bbassets', 'blinkit', 'grofers', 
-            'zepto', 'jiomart', 'swiggy', 'tataneu', 'dailymart4u', 'f.nooncdn', 
+            'zepto', 'swiggy', 'tataneu', 'dailymart4u', 'f.nooncdn', 
             'exportersindia', 'indiamart', 'dmart'
         ]
         if any(t in combined for t in trusted):
@@ -451,6 +456,10 @@ async def search_searxng_image(
             thumb = thumbnail_src or img_src or direct_img
 
             if direct_img:
+                # Exclude JioMart URLs completely as requested
+                if any(b in direct_img.lower() or b in page_url.lower() for b in ['jiomart']):
+                    continue
+
                 candidate_items.append(ImageResult(
                     title=title,
                     img_src=direct_img,
