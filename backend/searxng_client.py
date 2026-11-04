@@ -109,14 +109,68 @@ def verify_variant_size(words: List[str], title: str, variant_label: str, url: s
     ]
     return any(t in clean for t in targets)
 
+COMPETITOR_BRANDS = [
+    'rajbhog', 'narayani', 'patanjali', 'fortune', 'saffola', 'catch', 'everest',
+    'mdh', 'dhara', 'gemini', 'emami', 'quaker', 'gm foods', 'swadeshi', 'jayesh',
+    'kashi', 'mahatma', 'shri hans', 'tata', 'aashirvaad', '24 mantra', 'amul',
+    'britannia', 'parle', 'sunfeast', 'haldiram', 'bikaji', 'mtr', 'shakti bhog',
+    'aachi', 'priya', 'suhana', 'badshah', 'ramdev', 'annapurna', 'bawarchi',
+    'sarveshwari', 'goldiee', 'goldie', 'suruchi', 'saras', 'devaiah'
+]
+
+def contains_conflicting_brand(text: str, target_brand: str) -> bool:
+    """Checks if text contains a competitor brand that is not the target brand."""
+    if not text or not target_brand:
+        return False
+    t_brand = target_brand.lower().strip()
+    clean_text = text.lower()
+    for cb in COMPETITOR_BRANDS:
+        if cb in t_brand or t_brand in cb:
+            continue
+        if re.search(rf'\b{re.escape(cb)}\b', clean_text):
+            return True
+    return False
+
 def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") -> bool:
-    """Checks if brand name exists in image OCR text, title, or URL."""
+    """Checks if brand name exists in image OCR text, title, or URL, and strictly rejects competitor brands."""
     if not brand:
         return True
     brand_clean = brand.strip().lower()
     full_text = (" ".join(words) + " " + title + " " + url).lower()
 
-    # Specific brand keywords that uniquely identify the brand
+    # 1. STRICT COMPETITOR BRAND CHECK:
+    # If the title, URL, or packaging text mentions ANY other competitor brand (like Rajbhog, Narayani, etc.),
+    # IMMEDIATELY REJECT IT!
+    if contains_conflicting_brand(full_text, brand):
+        return False
+
+    # 2. IF OCR WORDS EXIST, VERIFY BRAND PRINTED ON PACKAGING:
+    # If OCR extracted readable text from the pack (words has >= 2 words), the target brand MUST be present on the packet!
+    if words and len(words) >= 2:
+        ocr_text = " ".join(words).lower()
+        if 'aashirvaad' in brand_clean:
+            if not ('aashirvaad' in ocr_text or 'asirvad' in ocr_text or 'ashirwad' in ocr_text):
+                return False
+        elif 'sampann' in brand_clean:
+            if not ('sampann' in ocr_text or 'tata' in ocr_text):
+                return False
+        elif 'mantra' in brand_clean:
+            if not ('mantra' in ocr_text or '24' in ocr_text):
+                return False
+        elif 'amul' in brand_clean:
+            if not ('amul' in ocr_text):
+                return False
+        elif 'fortune' in brand_clean:
+            if not ('fortune' in ocr_text):
+                return False
+        elif 'saffola' in brand_clean:
+            if not ('saffola' in ocr_text):
+                return False
+        elif '9am' in brand_clean:
+            if not ('9am' in ocr_text or '9 am' in ocr_text):
+                return False
+
+    # 3. Specific brand keywords that uniquely identify the brand
     known_brand_keys = {
         'tata': ['tata'],
         'tata sampann': ['sampann'],
