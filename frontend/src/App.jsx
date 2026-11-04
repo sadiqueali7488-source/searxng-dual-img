@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import axios from 'axios';
 import {
   Upload, Search, FileSpreadsheet, Download, Play, Pause, Square,
@@ -6,8 +6,181 @@ import {
   Copy, Check, Settings, Sparkles, Image as ImageIcon, ArrowRight,
   Database, Zap, Clock, ShieldCheck, Layers, ChevronDown, ChevronUp,
   X, Filter, RotateCw, Tag, ShoppingBag, DollarSign, ListFilter,
-  Sliders, Info, Edit3, ImagePlus, AlertTriangle
+  Sliders, Info, Edit3, ImagePlus, AlertTriangle,
+  ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 } from 'lucide-react';
+
+// Memoized individual TableRow component for maximum 60fps performance
+const TableRow = React.memo(function TableRow({
+  row,
+  index,
+  columns,
+  cyclingKey,
+  onOpenDetail,
+  onCycleImage
+}) {
+  return (
+    <tr
+      onClick={() => onOpenDetail(row)}
+      className="hover:bg-slate-800/50 transition-colors group cursor-pointer border-b border-slate-800/40"
+    >
+      <td className="p-3 text-center text-slate-500 font-mono text-[11px]">
+        {row.row_index + 1}
+      </td>
+
+      {/* 1. Product Image Thumbnail (Without Size) */}
+      <td className="p-2.5 text-center border-r border-slate-800/80 bg-indigo-950/10" onClick={(e) => e.stopPropagation()}>
+        <div className="flex flex-col items-center gap-1.5">
+          {row.product_image_url ? (
+            <div
+              onClick={() => onOpenDetail(row)}
+              className="w-16 h-16 rounded-lg bg-slate-950 border border-indigo-500/40 overflow-hidden cursor-pointer hover:border-indigo-400 transition flex items-center justify-center relative shadow"
+              title="Product Image (Without Size) - Click to zoom"
+            >
+              <img
+                src={row.product_thumbnail_url || row.product_image_url}
+                alt="Product"
+                loading="lazy"
+                decoding="async"
+                className="w-full h-full object-cover hover:scale-110 transition duration-150"
+                onError={(e) => {
+                  e.target.onerror = null;
+                  e.target.src = 'https://via.placeholder.com/80?text=No+Img';
+                }}
+              />
+            </div>
+          ) : (
+            <div className="w-16 h-16 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-600">
+              <ImageIcon className="w-5 h-5" />
+            </div>
+          )}
+
+          {row.product_alternatives && row.product_alternatives.length > 0 && (
+            <button
+              onClick={(e) => onCycleImage(row.row_index, 'product', e)}
+              disabled={cyclingKey === `${row.row_index}-product`}
+              className="bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 px-1.5 py-0.5 rounded text-[9px] font-sans font-semibold transition cursor-pointer active:scale-95 flex items-center space-x-1"
+              title="Cycle Product Image to next alternative"
+            >
+              <RotateCw className={`w-2.5 h-2.5 ${cyclingKey === `${row.row_index}-product` ? 'animate-spin' : ''}`} />
+              <span>Next ({row.product_alternatives.length})</span>
+            </button>
+          )}
+        </div>
+      </td>
+
+      {/* 2. Variant Image Thumbnail (With Size) */}
+      <td className="p-2.5 text-center border-r border-slate-800/80 bg-cyan-950/10" onClick={(e) => e.stopPropagation()}>
+        <div className="flex flex-col items-center gap-1.5">
+          {row.variant_image_url ? (
+            <div
+              onClick={() => onOpenDetail(row)}
+              className="w-16 h-16 rounded-lg bg-slate-950 border border-cyan-500/40 overflow-hidden cursor-pointer hover:border-cyan-400 transition flex items-center justify-center relative shadow"
+              title="Variant Image (With Size) - Click to zoom"
+            >
+              <img
+                src={row.variant_thumbnail_url || row.variant_image_url}
+                alt="Variant"
+                loading="lazy"
+                decoding="async"
+                className="w-full h-full object-cover hover:scale-110 transition duration-150"
+                onError={(e) => {
+                  e.target.onerror = null;
+                  e.target.src = 'https://via.placeholder.com/80?text=No+Img';
+                }}
+              />
+            </div>
+          ) : (
+            <div className="w-16 h-16 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-600">
+              <ImageIcon className="w-5 h-5" />
+            </div>
+          )}
+
+          {row.variant_alternatives && row.variant_alternatives.length > 0 && (
+            <button
+              onClick={(e) => onCycleImage(row.row_index, 'variant', e)}
+              disabled={cyclingKey === `${row.row_index}-variant`}
+              className="bg-cyan-600/20 hover:bg-cyan-600 text-cyan-300 hover:text-white border border-cyan-500/40 px-1.5 py-0.5 rounded text-[9px] font-sans font-semibold transition cursor-pointer active:scale-95 flex items-center space-x-1"
+              title="Cycle Variant Image to next alternative"
+            >
+              <RotateCw className={`w-2.5 h-2.5 ${cyclingKey === `${row.row_index}-variant` ? 'animate-spin' : ''}`} />
+              <span>Next ({row.variant_alternatives.length})</span>
+            </button>
+          )}
+        </div>
+      </td>
+
+      {/* Product Name & Queries */}
+      <td className="p-3">
+        <div className="font-sans font-medium text-slate-200 line-clamp-2 max-w-[240px]">
+          {row.original_data?.product_name || row.query}
+        </div>
+        <div className="text-[10px] text-indigo-400 font-mono mt-1 truncate max-w-[240px]">
+          🔹 No size: {row.product_query}
+        </div>
+        <div className="text-[10px] text-cyan-400 font-mono mt-0.5 truncate max-w-[240px]">
+          🔸 With size: {row.variant_query}
+        </div>
+      </td>
+
+      {/* Status */}
+      <td className="p-3 whitespace-nowrap">
+        {row.status === 'SUCCESS' && (
+          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+            <CheckCircle2 className="w-3 h-3" />
+            <span>Found</span>
+          </span>
+        )}
+        {row.status === 'PARTIAL' && (
+          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">
+            <CheckCircle2 className="w-3 h-3" />
+            <span>Partial</span>
+          </span>
+        )}
+        {row.status === 'SEARCHING' && (
+          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 animate-pulse">
+            <RefreshCw className="w-3 h-3 animate-spin" />
+            <span>Searching</span>
+          </span>
+        )}
+        {row.status === 'NOT_FOUND' && (
+          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/30">
+            <AlertCircle className="w-3 h-3" />
+            <span>Not Found</span>
+          </span>
+        )}
+        {row.status === 'PENDING' && (
+          <span className="text-[10px] text-slate-500 font-sans">
+            Queued
+          </span>
+        )}
+      </td>
+
+      {/* Prices with ₹ */}
+      <td className="p-3 font-mono whitespace-nowrap">
+        <div className="text-emerald-400 font-bold">{row.original_data?.sale_price || '—'}</div>
+        <div className="text-slate-500 text-[10px] line-through">{row.original_data?.mrp || ''}</div>
+      </td>
+
+      {/* Actions */}
+      <td className="p-3 text-center whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+        <button
+          onClick={() => onOpenDetail(row)}
+          className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-2.5 py-1 rounded text-[10px] font-sans font-medium transition cursor-pointer"
+        >
+          View Details
+        </button>
+      </td>
+
+      {/* Original columns */}
+      {columns.map((col) => (
+        <td key={col} className="p-3 text-slate-300 font-sans whitespace-nowrap max-w-[180px] truncate">
+          {row.original_data?.[col] !== undefined ? String(row.original_data[col]) : ''}
+        </td>
+      ))}
+    </tr>
+  );
+});
 
 export default function App() {
   const [searxngUrl, setSearxngUrl] = useState('http://localhost:8888');
@@ -35,22 +208,28 @@ export default function App() {
   const [filterStatus, setFilterStatus] = useState('ALL');
   const [tableSearch, setTableSearch] = useState('');
 
+  // Pagination states for super-fast 60fps rendering
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+
   const [detailModalRow, setDetailModalRow] = useState(null);
   const [customProductQuery, setCustomProductQuery] = useState('');
   const [customVariantQuery, setCustomVariantQuery] = useState('');
-  const [retryingTarget, setRetryingTarget] = useState(null); // 'product' | 'variant' | 'both'
-  const [cyclingKey, setCyclingKey] = useState(null); // `${rowIndex}-${target}`
-
-  const [quickSearchModal, setQuickSearchModal] = useState(false);
-  const [quickQuery, setQuickQuery] = useState('pizza hut');
-  const [quickResults, setQuickResults] = useState([]);
-  const [quickSearching, setQuickSearching] = useState(false);
+  const [retryingTarget, setRetryingTarget] = useState(null);
+  const [cyclingKey, setCyclingKey] = useState(null);
   const [copiedUrl, setCopiedUrl] = useState('');
 
+  // High-performance micro-batch update refs
   const eventSourceRef = useRef(null);
+  const updateBufferRef = useRef(new Map());
+  const batchTimerRef = useRef(null);
 
   useEffect(() => {
     checkSearxngConnection(searxngUrl);
+    return () => {
+      if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+      if (eventSourceRef.current) eventSourceRef.current.close();
+    };
   }, []);
 
   const checkSearxngConnection = async (url) => {
@@ -99,6 +278,7 @@ export default function App() {
 
       setRows([]);
       setJobStatus(null);
+      setCurrentPage(1);
     } catch (err) {
       alert('Upload failed: ' + (err.response?.data?.detail || err.message));
     } finally {
@@ -125,12 +305,39 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     }
   };
 
+  // High-performance flush: batches incoming rows every 60ms into a single React render!
+  const flushRowBatch = useCallback(() => {
+    if (updateBufferRef.current.size === 0) return;
+    const batch = Array.from(updateBufferRef.current.values());
+    updateBufferRef.current.clear();
+
+    setRows(prevRows => {
+      const next = [...prevRows];
+      for (const updatedRow of batch) {
+        const idx = next.findIndex(r => r.row_index === updatedRow.row_index);
+        if (idx >= 0) {
+          next[idx] = updatedRow;
+        } else {
+          next.push(updatedRow);
+        }
+      }
+      return next;
+    });
+
+    setDetailModalRow(prev => {
+      if (!prev) return prev;
+      const found = batch.find(r => r.row_index === prev.row_index);
+      return found || prev;
+    });
+  }, []);
+
   const handleStartSearch = async () => {
     if (!uploadData?.job_id || !queryColumn) return;
 
     try {
       setIsProcessing(true);
       setIsPaused(false);
+      setCurrentPage(1);
 
       const config = {
         searxng_url: searxngUrl,
@@ -171,26 +378,18 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
 
       es.addEventListener('row_update', (e) => {
         const updatedRow = JSON.parse(e.data);
-        setRows((prevRows) => {
-          const index = prevRows.findIndex(r => r.row_index === updatedRow.row_index);
-          if (index >= 0) {
-            const next = [...prevRows];
-            next[index] = updatedRow;
-            return next;
-          } else {
-            return [...prevRows, updatedRow];
-          }
-        });
+        updateBufferRef.current.set(updatedRow.row_index, updatedRow);
 
-        setDetailModalRow(prev => {
-          if (prev && prev.row_index === updatedRow.row_index) {
-            return updatedRow;
-          }
-          return prev;
-        });
+        if (!batchTimerRef.current) {
+          batchTimerRef.current = setTimeout(() => {
+            batchTimerRef.current = null;
+            flushRowBatch();
+          }, 60);
+        }
       });
 
       es.addEventListener('job_done', () => {
+        flushRowBatch();
         setIsProcessing(false);
         setIsRetryingNotFound(false);
         es.close();
@@ -205,7 +404,6 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     }
   };
 
-  // Bulk Retry for Not Found Rows Only
   const handleRetryNotFound = async () => {
     if (!uploadData?.job_id) return;
     try {
@@ -264,8 +462,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     window.location.href = `/api/download/${uploadData.job_id}?format=${format}`;
   };
 
-  // Swap specific image (target = 'product' | 'variant')
-  const handleSelectAlternativeImage = async (rowIndex, imageObj, target = 'product') => {
+  const handleSelectAlternativeImage = useCallback(async (rowIndex, imageObj, target = 'product') => {
     if (!uploadData?.job_id) return;
     try {
       const formData = new FormData();
@@ -279,16 +476,13 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
         next[rowIndex] = res.data.row;
         return next;
       });
-      if (detailModalRow?.row_index === rowIndex) {
-        setDetailModalRow(res.data.row);
-      }
+      setDetailModalRow(prev => prev?.row_index === rowIndex ? res.data.row : prev);
     } catch (err) {
       alert('Failed to swap image: ' + err.message);
     }
-  };
+  }, [uploadData]);
 
-  // Cycle image (target = 'product' | 'variant')
-  const handleCycleImage = async (rowIndex, target = 'product', e) => {
+  const handleCycleImage = useCallback(async (rowIndex, target = 'product', e) => {
     if (e) e.stopPropagation();
     if (!uploadData?.job_id) return;
 
@@ -301,17 +495,14 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
         next[rowIndex] = res.data.row;
         return next;
       });
-      if (detailModalRow?.row_index === rowIndex) {
-        setDetailModalRow(res.data.row);
-      }
+      setDetailModalRow(prev => prev?.row_index === rowIndex ? res.data.row : prev);
     } catch (err) {
       alert(err.response?.data?.detail || 'No more alternative images to cycle');
     } finally {
       setCyclingKey(null);
     }
-  };
+  }, [uploadData]);
 
-  // Retry single row with target ('product' | 'variant' | 'both')
   const handleRetrySingle = async (rowIndex, customQuery, target = 'both') => {
     if (!uploadData?.job_id) return;
     setRetryingTarget(target);
@@ -328,9 +519,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
         next[rowIndex] = res.data.row;
         return next;
       });
-      if (detailModalRow?.row_index === rowIndex) {
-        setDetailModalRow(res.data.row);
-      }
+      setDetailModalRow(prev => prev?.row_index === rowIndex ? res.data.row : prev);
     } catch (err) {
       alert('Retry failed: ' + err.message);
     } finally {
@@ -338,11 +527,11 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     }
   };
 
-  const openDetailModal = (row) => {
+  const openDetailModal = useCallback((row) => {
     setDetailModalRow(row);
     setCustomProductQuery(row.product_query || '');
     setCustomVariantQuery(row.variant_query || '');
-  };
+  }, []);
 
   const copyToClipboard = (text, e) => {
     if (e) e.stopPropagation();
@@ -351,21 +540,39 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     setTimeout(() => setCopiedUrl(''), 2000);
   };
 
-  const filteredRows = rows.filter((row) => {
-    if (filterStatus === 'SUCCESS' && row.status !== 'SUCCESS') return false;
-    if (filterStatus === 'NOT_FOUND' && row.status !== 'NOT_FOUND') return false;
-    if (filterStatus === 'ERROR' && row.status !== 'ERROR') return false;
-    if (tableSearch.trim()) {
-      const q = tableSearch.toLowerCase();
-      const matchP = row.product_query?.toLowerCase().includes(q);
-      const matchV = row.variant_query?.toLowerCase().includes(q);
-      const matchOrig = Object.values(row.original_data || {}).some(
-        val => String(val).toLowerCase().includes(q)
-      );
-      return matchP || matchV || matchOrig;
+  // High performance memoized row filtering
+  const filteredRows = useMemo(() => {
+    let list = rows;
+    if (filterStatus === 'SUCCESS') list = list.filter(r => r.status === 'SUCCESS');
+    else if (filterStatus === 'NOT_FOUND') list = list.filter(r => r.status === 'NOT_FOUND');
+    else if (filterStatus === 'ERROR') list = list.filter(r => r.status === 'ERROR');
+
+    const q = tableSearch.trim().toLowerCase();
+    if (q) {
+      list = list.filter(row => {
+        const matchP = row.product_query?.toLowerCase().includes(q);
+        const matchV = row.variant_query?.toLowerCase().includes(q);
+        const matchOrig = Object.values(row.original_data || {}).some(
+          val => String(val).toLowerCase().includes(q)
+        );
+        return matchP || matchV || matchOrig;
+      });
     }
-    return true;
-  });
+    return list;
+  }, [rows, filterStatus, tableSearch]);
+
+  // High performance paginated rows slice
+  const totalPages = useMemo(() => {
+    if (pageSize === 'ALL') return 1;
+    return Math.max(1, Math.ceil(filteredRows.length / Number(pageSize)));
+  }, [filteredRows.length, pageSize]);
+
+  const paginatedRows = useMemo(() => {
+    if (pageSize === 'ALL') return filteredRows;
+    const size = Number(pageSize);
+    const start = (currentPage - 1) * size;
+    return filteredRows.slice(start, start + size);
+  }, [filteredRows, currentPage, pageSize]);
 
   const getProductPreviewQuery = () => {
     if (!uploadData || !uploadData.preview || uploadData.preview.length === 0) return '';
@@ -412,11 +619,11 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                 SearXNG Product Image Finder
               </h1>
               <span className="px-2 py-0.5 text-[10px] font-bold bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 rounded-full tracking-wide">
-                Dual Engine: Product (No Size) + Variant (With Size)
+                Dual Front Packshot (AI OCR)
               </span>
             </div>
             <p className="text-[11px] text-slate-400">
-              SearXNG 2nd Image • Google, Bing & DDG Only • Direct Clean URLs
+              SearXNG Multi-Engine • Google, Bing & Brave • Ultra-Smooth 60fps
             </p>
           </div>
         </div>
@@ -454,121 +661,120 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
         </div>
       </header>
 
-      {/* SearXNG Settings */}
+      {/* Settings Flyout */}
       {showSettings && (
-        <div className="bg-slate-900 border-b border-indigo-500/30 px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center space-x-4 max-w-2xl w-full">
-            <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider whitespace-nowrap">
-              SearXNG Endpoint:
-            </label>
+        <div className="bg-slate-900 border-b border-slate-800 p-4 animate-in slide-in-from-top duration-200 text-xs">
+          <div className="max-w-4xl mx-auto flex items-center space-x-4">
+            <label className="text-slate-400 whitespace-nowrap font-medium">SearXNG Base URL:</label>
             <input
               type="text"
               value={searxngUrl}
               onChange={(e) => setSearxngUrl(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white w-full focus:outline-none focus:border-indigo-500 font-mono"
-              placeholder="http://localhost:8888"
+              className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-white font-mono"
             />
             <button
               onClick={() => checkSearxngConnection(searxngUrl)}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-4 py-1.5 rounded-lg font-medium transition cursor-pointer active:scale-95"
+              className="bg-indigo-600 hover:bg-indigo-500 px-4 py-1.5 rounded-lg text-white font-semibold transition cursor-pointer"
             >
-              Test & Save
+              Save & Test
             </button>
-          </div>
-          <div className="text-xs text-slate-400 flex items-center space-x-2">
-            <span>Status:</span>
-            <span className={searxngStatus.connected ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'}>
+            <span className={`text-[11px] ${searxngStatus.connected ? 'text-emerald-400' : 'text-rose-400'}`}>
               {searxngStatus.message}
             </span>
           </div>
         </div>
       )}
 
-      {/* Main Content Area */}
+      {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6">
-        
-        {/* Step 1 & Step 2 Grid */}
+
+        {/* STEP 1 & 2: Top Setup Cards */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          
+
           {/* STEP 1: Upload Card */}
           <div className="lg:col-span-5 bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
             <div>
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center space-x-2">
-                  <div className="w-7 h-7 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center font-bold text-sm">
-                    1
-                  </div>
-                  <h2 className="text-sm font-semibold text-white tracking-wide">
-                    Upload CSV or Excel
-                  </h2>
+              <div className="flex items-center space-x-2 mb-4">
+                <div className="w-7 h-7 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center font-bold text-sm">
+                  1
                 </div>
-                <button
-                  onClick={loadSampleData}
-                  disabled={uploading}
-                  className="text-xs bg-slate-800 hover:bg-slate-700 text-indigo-300 hover:text-indigo-200 border border-slate-700/70 px-2.5 py-1 rounded-md transition cursor-pointer active:scale-95 flex items-center space-x-1"
-                >
-                  <Database className="w-3 h-3" />
-                  <span>Load Sample 30-Cols</span>
-                </button>
+                <h2 className="text-sm font-semibold text-white tracking-wide">
+                  Upload Product Master (CSV/XLSX)
+                </h2>
               </div>
 
-              <label className="border-2 border-dashed border-slate-700 hover:border-indigo-500 bg-slate-950/40 hover:bg-slate-950/80 rounded-xl p-6 flex flex-col items-center justify-center cursor-pointer transition group">
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (e.dataTransfer.files?.[0]) handleFileUpload(e.dataTransfer.files[0]);
+                }}
+                className="border-2 border-dashed border-slate-700/80 hover:border-indigo-500/80 bg-slate-950/40 rounded-xl p-6 text-center transition cursor-pointer group"
+                onClick={() => document.getElementById('file-upload-input')?.click()}
+              >
                 <input
+                  id="file-upload-input"
                   type="file"
                   accept=".csv,.xlsx,.xls"
                   className="hidden"
-                  onChange={(e) => handleFileUpload(e.target.files[0])}
-                  disabled={uploading}
+                  onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
                 />
-                <div className="w-12 h-12 rounded-full bg-slate-800/80 group-hover:bg-indigo-600/20 flex items-center justify-center mb-3 group-hover:scale-110 transition-transform">
-                  <Upload className="w-6 h-6 text-slate-400 group-hover:text-indigo-400" />
+                <div className="w-12 h-12 rounded-xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition">
+                  {uploading ? (
+                    <RefreshCw className="w-6 h-6 animate-spin" />
+                  ) : (
+                    <Upload className="w-6 h-6" />
+                  )}
                 </div>
-                <p className="text-sm font-medium text-slate-200 group-hover:text-indigo-300">
-                  {uploading ? 'Processing file...' : 'Drop your CSV or Excel file here'}
+                <p className="text-xs font-medium text-slate-300">
+                  {file ? file.name : 'Drag & drop file or browse'}
                 </p>
-                <p className="text-xs text-slate-500 mt-1">
-                  Product Master 30 Columns • Auto Dual-Image Search
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Supports CSV, XLSX (Full 30-Column Product Master)
                 </p>
-              </label>
+              </div>
 
-              {uploadData && (
-                <div className="mt-4 p-3 bg-slate-950/60 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
-                  <div className="flex items-center space-x-2.5 truncate">
-                    <FileSpreadsheet className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span className="font-medium text-white truncate max-w-[180px]">
-                      {uploadData.filename}
-                    </span>
-                  </div>
-                  <div className="flex items-center space-x-3 text-slate-400 shrink-0 font-mono">
-                    <span className="bg-slate-800 px-2 py-0.5 rounded text-[11px] text-emerald-400">
-                      {uploadData.total_rows} rows
-                    </span>
-                    <span className="bg-slate-800 px-2 py-0.5 rounded text-[11px] text-indigo-300">
-                      {uploadData.columns.length} columns
-                    </span>
-                  </div>
-                </div>
-              )}
+              <div className="mt-3 flex items-center justify-between">
+                <button
+                  onClick={loadSampleData}
+                  className="text-indigo-400 hover:text-indigo-300 text-xs flex items-center space-x-1 cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Load Sample 30-Column Dataset</span>
+                </button>
+                {uploadData && (
+                  <span className="text-[11px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded">
+                    {uploadData.total_rows} Rows Loaded
+                  </span>
+                )}
+              </div>
             </div>
 
             {uploadData && (
-              <div className="mt-4 pt-4 border-t border-slate-800/60">
-                <p className="text-xs font-semibold text-slate-400 mb-2">30 Original Columns Intact:</p>
-                <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto">
-                  {uploadData.columns.map((col) => (
+              <div className="mt-4 pt-3 border-t border-slate-800 text-xs">
+                <span className="text-slate-400 block text-[11px] mb-1 font-semibold">
+                  Detected Columns ({uploadData.columns.length}):
+                </span>
+                <div className="flex flex-wrap gap-1 max-h-20 overflow-y-auto">
+                  {uploadData.columns.slice(0, 10).map((col) => (
                     <span
                       key={col}
-                      className="text-[10px] bg-slate-800/70 text-slate-300 px-2 py-0.5 rounded border border-slate-700/50 font-mono"
+                      className="bg-slate-800 text-slate-300 text-[10px] px-2 py-0.5 rounded font-mono"
                     >
                       {col}
                     </span>
                   ))}
+                  {uploadData.columns.length > 10 && (
+                    <span className="text-[10px] text-slate-500 self-center">
+                      +{uploadData.columns.length - 10} more
+                    </span>
+                  )}
                 </div>
               </div>
             )}
           </div>
 
-          {/* STEP 2: Dual Query Mapping Card */}
+          {/* STEP 2: Smart Dual Front Packshot Card */}
           <div className="lg:col-span-7 bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
             <div>
               <div className="flex items-center space-x-2 mb-4">
@@ -597,11 +803,11 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                           1. Product Image: Without Size
                         </span>
                         <span className="text-[9px] bg-indigo-500/20 text-indigo-300 px-1.5 py-0.2 rounded font-mono">
-                          brand + name
+                          brand + name (no size)
                         </span>
                       </div>
                       <p className="text-[10px] text-slate-400">
-                        Searches general product pack without size constraints
+                        Picks clean front packaging pouch without size callout
                       </p>
                       <div className="text-emerald-300 font-mono text-[11px] font-semibold truncate pt-1 border-t border-slate-800">
                         "{getProductPreviewQuery()}"
@@ -619,7 +825,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                         </span>
                       </div>
                       <p className="text-[10px] text-slate-400">
-                        Searches specific variant pack with exact size/weight
+                        Inspects front pack for verified exact variant size
                       </p>
                       <div className="text-cyan-300 font-mono text-[11px] font-semibold truncate pt-1 border-t border-slate-800">
                         "{getVariantPreviewQuery()}"
@@ -627,7 +833,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                     </div>
                   </div>
 
-                  {/* Primary column selection */}
+                  {/* Primary column selection & Concurrency */}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-slate-300 font-semibold mb-1">
@@ -651,10 +857,10 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                       <input
                         type="range"
                         min="1"
-                        max="20"
+                        max="12"
                         value={concurrency}
-                        onChange={(e) => setConcurrency(e.target.value)}
-                        className="w-full accent-indigo-500 cursor-pointer mt-1"
+                        onChange={(e) => setConcurrency(Number(e.target.value))}
+                        className="w-full accent-indigo-500 cursor-pointer"
                       />
                     </div>
                   </div>
@@ -662,227 +868,194 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
               )}
             </div>
 
-            {/* Action Bar */}
-            <div className="mt-5 pt-4 border-t border-slate-800 flex items-center justify-between">
-              <div className="flex items-center space-x-2">
-                {isProcessing && (
-                  <>
-                    {isPaused ? (
-                      <button
-                        onClick={handleResume}
-                        className="flex items-center space-x-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs px-3 py-2 rounded-lg font-semibold transition cursor-pointer active:scale-95"
-                      >
-                        <Play className="w-3.5 h-3.5" />
-                        <span>Resume</span>
-                      </button>
-                    ) : (
-                      <button
-                        onClick={handlePause}
-                        className="flex items-center space-x-1.5 bg-amber-600/30 hover:bg-amber-600/50 border border-amber-500/40 text-amber-300 text-xs px-3 py-2 rounded-lg font-semibold transition cursor-pointer active:scale-95"
-                      >
-                        <Pause className="w-3.5 h-3.5" />
-                        <span>Pause</span>
-                      </button>
-                    )}
-                    <button
-                      onClick={handleCancel}
-                      className="flex items-center space-x-1.5 bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-300 text-xs px-3 py-2 rounded-lg font-semibold transition cursor-pointer active:scale-95"
-                    >
-                      <Square className="w-3.5 h-3.5" />
-                      <span>Stop</span>
-                    </button>
-                  </>
-                )}
-              </div>
+            {/* Launch Bar */}
+            <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between">
+              <span className="text-[11px] text-slate-400 font-mono">
+                {uploadData ? `${uploadData.total_rows} items ready` : 'Awaiting file...'}
+              </span>
 
-              <button
-                onClick={handleStartSearch}
-                disabled={!uploadData || isProcessing}
-                className={`flex items-center space-x-2 px-6 py-2.5 rounded-xl font-bold text-xs transition cursor-pointer shadow-lg ${
-                  !uploadData || isProcessing
-                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                    : 'bg-gradient-to-r from-indigo-500 via-indigo-600 to-indigo-700 hover:from-indigo-400 hover:to-indigo-600 text-white shadow-indigo-500/30 active:scale-95'
-                }`}
-              >
-                <Zap className="w-4 h-4 fill-current" />
-                <span>{isProcessing ? 'Processing Both Queries...' : 'Start Dual Image Search'}</span>
-              </button>
+              <div className="flex space-x-2">
+                {isProcessing && (
+                  <button
+                    onClick={isPaused ? handleResume : handlePause}
+                    className="bg-amber-600/30 hover:bg-amber-600/50 text-amber-300 border border-amber-500/40 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1 cursor-pointer transition"
+                  >
+                    {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                    <span>{isPaused ? 'Resume' : 'Pause'}</span>
+                  </button>
+                )}
+
+                {isProcessing && (
+                  <button
+                    onClick={handleCancel}
+                    className="bg-rose-600/30 hover:bg-rose-600/50 text-rose-300 border border-rose-500/40 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1 cursor-pointer transition"
+                  >
+                    <Square className="w-3.5 h-3.5" />
+                    <span>Stop</span>
+                  </button>
+                )}
+
+                <button
+                  onClick={handleStartSearch}
+                  disabled={!uploadData || isProcessing}
+                  className={`bg-gradient-to-r from-indigo-600 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 text-white font-bold px-5 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 shadow-lg shadow-indigo-500/20 transition cursor-pointer active:scale-95 ${
+                    (!uploadData || isProcessing) ? 'opacity-50 cursor-not-allowed' : ''
+                  }`}
+                >
+                  <Play className="w-3.5 h-3.5 fill-white" />
+                  <span>Start Dual Search</span>
+                </button>
+              </div>
             </div>
           </div>
+
         </div>
 
-        {/* STEP 3: Progress & Real-Time Stats with BULK RETRY NOT-FOUND */}
-        {(jobStatus || rows.length > 0) && (
-          <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div>
-                <h3 className="text-sm font-bold text-white flex items-center space-x-2">
-                  <span>Processing Progress</span>
-                  {jobStatus?.state === 'running' && (
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 animate-pulse font-sans">
-                      Live Running
-                    </span>
-                  )}
-                  {jobStatus?.state === 'completed' && (
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 font-sans">
-                      Finished
-                    </span>
-                  )}
-                </h3>
-                {jobStatus?.current_query && (
-                  <p className="text-xs text-slate-400 font-mono mt-0.5 truncate max-w-md">
-                    Current: <span className="text-indigo-300">{jobStatus.current_query}</span>
-                  </p>
-                )}
+        {/* PROGRESS BAR & STATS PANEL */}
+        {jobStatus && (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl space-y-3">
+            <div className="flex items-center justify-between text-xs font-mono">
+              <div className="flex items-center space-x-3">
+                <span className="text-white font-bold">
+                  Progress: {jobStatus.processed_rows} / {jobStatus.total_rows} ({jobStatus.progress_percent}%)
+                </span>
+                <span className="text-slate-400 truncate max-w-md">
+                  Active: {jobStatus.current_query || '—'}
+                </span>
               </div>
-
-              {/* Action Toolbar: RETRY NOT FOUND + DOWNLOAD */}
-              <div className="flex flex-wrap items-center gap-2">
-                {/* DEDICATED RETRY ALL NOT FOUND BUTTON */}
-                <button
-                  onClick={handleRetryNotFound}
-                  disabled={isProcessing}
-                  className={`flex items-center space-x-1.5 text-xs px-3.5 py-2 rounded-lg font-bold transition shadow-md cursor-pointer active:scale-95 ${
-                    isProcessing
-                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
-                      : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300 shadow-amber-500/10'
-                  }`}
-                  title="Run retry only on rows that failed or were not found"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isRetryingNotFound ? 'animate-spin' : ''}`} />
-                  <span>Retry All Not-Found ({jobStatus?.not_found_count || 0})</span>
-                </button>
-
-                <button
-                  onClick={() => handleDownload('csv')}
-                  className="flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-500/30 text-xs px-3.5 py-2 rounded-lg font-medium transition shadow-sm cursor-pointer active:scale-95"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download Clean CSV</span>
-                </button>
-                <button
-                  onClick={() => handleDownload('xlsx')}
-                  className="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3.5 py-2 rounded-lg font-medium transition shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-95"
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5" />
-                  <span>Download Excel (.xlsx)</span>
-                </button>
+              <div className="flex items-center space-x-3 text-[11px]">
+                <span className="text-emerald-400">Found: {jobStatus.success_count}</span>
+                <span className="text-amber-400">Not Found: {jobStatus.not_found_count}</span>
+                <span className="text-rose-400">Errors: {jobStatus.error_count}</span>
               </div>
             </div>
 
-            {/* Visual Progress Bar */}
-            <div className="space-y-1.5">
-              <div className="flex justify-between text-xs text-slate-400 font-mono">
-                <span>
-                  {jobStatus?.processed_rows || 0} of {jobStatus?.total_rows || 0} rows completed
-                </span>
-                <span className="font-bold text-indigo-400">
-                  {jobStatus?.progress_percent || 0}%
-                </span>
-              </div>
-              <div className="w-full h-3 bg-slate-950 rounded-full overflow-hidden border border-slate-800 p-0.5">
-                <div
-                  className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-cyan-400 rounded-full transition-all duration-300 shadow-[0_0_12px_#6366f1]"
-                  style={{ width: `${jobStatus?.progress_percent || 0}%` }}
-                />
-              </div>
-            </div>
-
-            {/* Metric Stat Cards */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-2">
-              <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl flex items-center space-x-3">
-                <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-400">
-                  <CheckCircle2 className="w-5 h-5" />
-                </div>
-                <div>
-                  <div className="text-lg font-bold text-emerald-400 font-mono">
-                    {jobStatus?.success_count || 0}
-                  </div>
-                  <div className="text-[11px] text-slate-400">Images Found</div>
-                </div>
-              </div>
-
-              <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl flex items-center space-x-3">
-                <div className="p-2 rounded-lg bg-rose-500/10 text-rose-400">
-                  <XCircle className="w-5 h-5" />
-                </div>
-                <div>
-                  <div className="text-lg font-bold text-rose-400 font-mono">
-                    {(jobStatus?.not_found_count || 0) + (jobStatus?.error_count || 0)}
-                  </div>
-                  <div className="text-[11px] text-slate-400">Not Found (Retry Available)</div>
-                </div>
-              </div>
-
-              <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl flex items-center space-x-3">
-                <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400">
-                  <Zap className="w-5 h-5" />
-                </div>
-                <div>
-                  <div className="text-lg font-bold text-indigo-400 font-mono">
-                    {jobStatus?.speed_rows_per_sec || 0} <span className="text-xs font-normal">/s</span>
-                  </div>
-                  <div className="text-[11px] text-slate-400">Speed (Rows/sec)</div>
-                </div>
-              </div>
-
-              <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl flex items-center space-x-3">
-                <div className="p-2 rounded-lg bg-cyan-500/10 text-cyan-400">
-                  <Clock className="w-5 h-5" />
-                </div>
-                <div>
-                  <div className="text-lg font-bold text-cyan-400 font-mono">
-                    {jobStatus?.eta_seconds ? `${jobStatus.eta_seconds}s` : '0s'}
-                  </div>
-                  <div className="text-[11px] text-slate-400">Estimated ETA</div>
-                </div>
-              </div>
+            <div className="w-full bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
+              <div
+                className="bg-gradient-to-r from-indigo-500 via-indigo-400 to-emerald-400 h-full transition-all duration-300"
+                style={{ width: `${jobStatus.progress_percent}%` }}
+              />
             </div>
           </div>
         )}
 
-        {/* STEP 4: Live Results Table with DUAL IMAGE PREVIEWS */}
+        {/* STEP 3: RESULTS DATASET TABLE */}
         {rows.length > 0 && (
-          <div className="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl overflow-hidden flex flex-col">
-            {/* Table Header & Filters */}
-            <div className="p-4 border-b border-slate-800 bg-slate-900 flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl space-y-0">
+            
+            {/* Table Toolbar */}
+            <div className="p-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 bg-slate-950/40">
               <div className="flex items-center space-x-3">
-                <h3 className="text-sm font-bold text-white flex items-center space-x-2">
-                  <span>Results Table</span>
-                  <span className="text-xs text-indigo-400 font-mono">({filteredRows.length} displayed)</span>
-                </h3>
-                <div className="flex items-center bg-slate-950 rounded-lg p-0.5 border border-slate-800 text-xs">
+                
+                {/* Filter buttons */}
+                <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
                   {['ALL', 'SUCCESS', 'NOT_FOUND', 'ERROR'].map((st) => (
                     <button
                       key={st}
-                      onClick={() => setFilterStatus(st)}
-                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition cursor-pointer ${
+                      onClick={() => {
+                        setFilterStatus(st);
+                        setCurrentPage(1);
+                      }}
+                      className={`px-3 py-1 rounded-lg font-medium transition cursor-pointer text-xs ${
                         filterStatus === st
-                          ? 'bg-indigo-600 text-white'
-                          : 'text-slate-400 hover:text-slate-200'
+                          ? 'bg-indigo-600 text-white shadow'
+                          : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      {st === 'ALL' ? 'All' : st === 'SUCCESS' ? 'Found' : st === 'NOT_FOUND' ? 'Not Found' : 'Errors'}
+                      {st === 'ALL' && `All (${rows.length})`}
+                      {st === 'SUCCESS' && `Found (${rows.filter(r => r.status === 'SUCCESS').length})`}
+                      {st === 'NOT_FOUND' && `Not Found (${rows.filter(r => r.status === 'NOT_FOUND').length})`}
+                      {st === 'ERROR' && `Errors (${rows.filter(r => r.status === 'ERROR').length})`}
                     </button>
                   ))}
                 </div>
+
+                {/* Bulk Retry for Not Found Rows */}
+                {rows.filter(r => r.status === 'NOT_FOUND').length > 0 && (
+                  <button
+                    onClick={handleRetryNotFound}
+                    disabled={isRetryingNotFound || isProcessing}
+                    className="bg-amber-600/20 hover:bg-amber-600 text-amber-300 hover:text-white border border-amber-500/40 px-3 py-1 rounded-xl text-xs font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95 disabled:opacity-50"
+                    title="Run search only on Not Found rows"
+                  >
+                    <RotateCw className={`w-3.5 h-3.5 ${isRetryingNotFound ? 'animate-spin' : ''}`} />
+                    <span>Retry Not Found ({rows.filter(r => r.status === 'NOT_FOUND').length})</span>
+                  </button>
+                )}
               </div>
 
-              {/* Table search filter */}
-              <div className="relative max-w-xs w-full">
-                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
-                <input
-                  type="text"
-                  placeholder="Filter rows by text..."
-                  value={tableSearch}
-                  onChange={(e) => setTableSearch(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-9 pr-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
-                />
+              {/* Right Toolbar: Search & Export */}
+              <div className="flex items-center space-x-3">
+                
+                {/* Instant Table Search Filter */}
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2.5" />
+                  <input
+                    type="text"
+                    value={tableSearch}
+                    onChange={(e) => {
+                      setTableSearch(e.target.value);
+                      setCurrentPage(1);
+                    }}
+                    placeholder="Search product / query..."
+                    className="bg-slate-950 border border-slate-700 rounded-xl pl-8 pr-3 py-1.5 text-xs text-white placeholder-slate-500 w-56 focus:outline-none focus:border-indigo-500"
+                  />
+                  {tableSearch && (
+                    <button
+                      onClick={() => {
+                        setTableSearch('');
+                        setCurrentPage(1);
+                      }}
+                      className="absolute right-2.5 top-2.5 text-slate-400 hover:text-white"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Page size selector */}
+                <div className="flex items-center space-x-1.5 text-xs text-slate-400 bg-slate-950 px-2 py-1 rounded-xl border border-slate-800">
+                  <span>Show:</span>
+                  <select
+                    value={pageSize}
+                    onChange={(e) => {
+                      setPageSize(e.target.value === 'ALL' ? 'ALL' : Number(e.target.value));
+                      setCurrentPage(1);
+                    }}
+                    className="bg-transparent text-indigo-400 font-semibold cursor-pointer outline-none"
+                  >
+                    <option value={25}>25</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                    <option value={200}>200</option>
+                    <option value="ALL">All</option>
+                  </select>
+                </div>
+
+                {/* Export Buttons */}
+                <div className="flex space-x-1.5">
+                  <button
+                    onClick={() => handleDownload('csv')}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center space-x-1 cursor-pointer transition active:scale-95"
+                    title="Download updated CSV with pure image links"
+                  >
+                    <Download className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>CSV</span>
+                  </button>
+                  <button
+                    onClick={() => handleDownload('xlsx')}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center space-x-1 cursor-pointer transition active:scale-95"
+                    title="Download updated Excel spreadsheet"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Excel</span>
+                  </button>
+                </div>
               </div>
             </div>
 
-            {/* Responsive Table Scroll Container */}
-            <div className="overflow-x-auto max-h-[600px] overflow-y-auto">
+            {/* High Performance Responsive Table */}
+            <div className="overflow-x-auto max-h-[620px] overflow-y-auto">
               <table className="w-full text-left border-collapse text-xs">
                 <thead className="bg-slate-950/95 sticky top-0 z-10 text-slate-400 font-semibold uppercase tracking-wider text-[10px] border-b border-slate-800">
                   <tr>
@@ -910,167 +1083,77 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 font-mono">
-                  {filteredRows.map((row) => (
-                    <tr
+                  {paginatedRows.map((row) => (
+                    <TableRow
                       key={row.row_index}
-                      onClick={() => openDetailModal(row)}
-                      className="hover:bg-slate-800/40 transition-colors group cursor-pointer"
-                    >
-                      <td className="p-3 text-center text-slate-500 font-mono text-[11px]">
-                        {row.row_index + 1}
-                      </td>
-
-                      {/* 1. Product Image Thumbnail (Without Size) */}
-                      <td className="p-3 text-center border-r border-slate-800/80 bg-indigo-950/10" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex flex-col items-center gap-1.5">
-                          {row.product_image_url ? (
-                            <div
-                              onClick={() => openDetailModal(row)}
-                              className="w-16 h-16 rounded-lg bg-slate-950 border border-indigo-500/40 overflow-hidden cursor-pointer hover:border-indigo-400 transition flex items-center justify-center relative shadow"
-                              title="Product Image (Without Size) - Click to zoom"
-                            >
-                              <img
-                                src={row.product_thumbnail_url || row.product_image_url}
-                                alt="Product"
-                                className="w-full h-full object-cover hover:scale-110 transition duration-200"
-                                onError={(e) => {
-                                  e.target.onerror = null;
-                                  e.target.src = 'https://via.placeholder.com/80?text=No+Img';
-                                }}
-                              />
-                            </div>
-                          ) : (
-                            <div className="w-16 h-16 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-600">
-                              <ImageIcon className="w-5 h-5" />
-                            </div>
-                          )}
-
-                          {row.product_alternatives && row.product_alternatives.length > 0 && (
-                            <button
-                              onClick={(e) => handleCycleImage(row.row_index, 'product', e)}
-                              disabled={cyclingKey === `${row.row_index}-product`}
-                              className="bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 px-1.5 py-0.5 rounded text-[9px] font-sans font-semibold transition cursor-pointer active:scale-95 flex items-center space-x-1"
-                              title="Cycle Product Image to next alternative"
-                            >
-                              <RotateCw className={`w-2.5 h-2.5 ${cyclingKey === `${row.row_index}-product` ? 'animate-spin' : ''}`} />
-                              <span>Next ({row.product_alternatives.length})</span>
-                            </button>
-                          )}
-                        </div>
-                      </td>
-
-                      {/* 2. Variant Image Thumbnail (With Size) */}
-                      <td className="p-3 text-center border-r border-slate-800/80 bg-cyan-950/10" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex flex-col items-center gap-1.5">
-                          {row.variant_image_url ? (
-                            <div
-                              onClick={() => openDetailModal(row)}
-                              className="w-16 h-16 rounded-lg bg-slate-950 border border-cyan-500/40 overflow-hidden cursor-pointer hover:border-cyan-400 transition flex items-center justify-center relative shadow"
-                              title="Variant Image (With Size) - Click to zoom"
-                            >
-                              <img
-                                src={row.variant_thumbnail_url || row.variant_image_url}
-                                alt="Variant"
-                                className="w-full h-full object-cover hover:scale-110 transition duration-200"
-                                onError={(e) => {
-                                  e.target.onerror = null;
-                                  e.target.src = 'https://via.placeholder.com/80?text=No+Img';
-                                }}
-                              />
-                            </div>
-                          ) : (
-                            <div className="w-16 h-16 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-600">
-                              <ImageIcon className="w-5 h-5" />
-                            </div>
-                          )}
-
-                          {row.variant_alternatives && row.variant_alternatives.length > 0 && (
-                            <button
-                              onClick={(e) => handleCycleImage(row.row_index, 'variant', e)}
-                              disabled={cyclingKey === `${row.row_index}-variant`}
-                              className="bg-cyan-600/20 hover:bg-cyan-600 text-cyan-300 hover:text-white border border-cyan-500/40 px-1.5 py-0.5 rounded text-[9px] font-sans font-semibold transition cursor-pointer active:scale-95 flex items-center space-x-1"
-                              title="Cycle Variant Image to next alternative"
-                            >
-                              <RotateCw className={`w-2.5 h-2.5 ${cyclingKey === `${row.row_index}-variant` ? 'animate-spin' : ''}`} />
-                              <span>Next ({row.variant_alternatives.length})</span>
-                            </button>
-                          )}
-                        </div>
-                      </td>
-
-                      {/* Product Name & Both Queries */}
-                      <td className="p-3">
-                        <div className="font-sans font-medium text-slate-200 line-clamp-2 max-w-[240px]">
-                          {row.original_data?.product_name || row.query}
-                        </div>
-                        <div className="text-[10px] text-indigo-400 font-mono mt-1 truncate max-w-[240px]">
-                          🔹 No size: {row.product_query}
-                        </div>
-                        <div className="text-[10px] text-cyan-400 font-mono mt-0.5 truncate max-w-[240px]">
-                          🔸 With size: {row.variant_query}
-                        </div>
-                      </td>
-
-                      {/* Status */}
-                      <td className="p-3">
-                        {row.status === 'SUCCESS' && (
-                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                            <CheckCircle2 className="w-3 h-3" />
-                            <span>Found</span>
-                          </span>
-                        )}
-                        {row.status === 'PARTIAL' && (
-                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">
-                            <CheckCircle2 className="w-3 h-3" />
-                            <span>Partial</span>
-                          </span>
-                        )}
-                        {row.status === 'SEARCHING' && (
-                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 animate-pulse">
-                            <RefreshCw className="w-3 h-3 animate-spin" />
-                            <span>Searching</span>
-                          </span>
-                        )}
-                        {row.status === 'NOT_FOUND' && (
-                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/30">
-                            <AlertCircle className="w-3 h-3" />
-                            <span>Not Found</span>
-                          </span>
-                        )}
-                        {row.status === 'PENDING' && (
-                          <span className="text-[10px] text-slate-500 font-sans">
-                            Queued
-                          </span>
-                        )}
-                      </td>
-
-                      {/* Prices with ₹ */}
-                      <td className="p-3 font-mono">
-                        <div className="text-emerald-400 font-bold">{row.original_data?.sale_price || '—'}</div>
-                        <div className="text-slate-500 text-[10px] line-through">{row.original_data?.mrp || ''}</div>
-                      </td>
-
-                      {/* Actions */}
-                      <td className="p-3 text-center" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => openDetailModal(row)}
-                          className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-2.5 py-1 rounded text-[10px] font-sans font-medium transition cursor-pointer"
-                        >
-                          View Details
-                        </button>
-                      </td>
-
-                      {/* Original columns */}
-                      {uploadData?.columns?.map((col) => (
-                        <td key={col} className="p-3 text-slate-300 font-sans whitespace-nowrap max-w-[180px] truncate">
-                          {row.original_data?.[col] !== undefined ? String(row.original_data[col]) : ''}
-                        </td>
-                      ))}
-                    </tr>
+                      row={row}
+                      index={row.row_index}
+                      columns={uploadData?.columns || []}
+                      cyclingKey={cyclingKey}
+                      onOpenDetail={openDetailModal}
+                      onCycleImage={handleCycleImage}
+                    />
                   ))}
+                  {paginatedRows.length === 0 && (
+                    <tr>
+                      <td colSpan={7 + (uploadData?.columns?.length || 0)} className="text-center py-12 text-slate-500 font-sans text-xs">
+                        No rows found matching the current filter.
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
+
+            {/* Pagination Bottom Bar */}
+            <div className="p-3 border-t border-slate-800 bg-slate-950/70 flex items-center justify-between text-xs text-slate-400">
+              <div className="font-mono text-[11px]">
+                Showing {filteredRows.length > 0 ? (currentPage - 1) * (pageSize === 'ALL' ? filteredRows.length : pageSize) + 1 : 0} – {Math.min(currentPage * (pageSize === 'ALL' ? filteredRows.length : pageSize), filteredRows.length)} of {filteredRows.length} rows
+              </div>
+
+              {totalPages > 1 && (
+                <div className="flex items-center space-x-1.5">
+                  <button
+                    onClick={() => setCurrentPage(1)}
+                    disabled={currentPage === 1}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    title="First page"
+                  >
+                    <ChevronsLeft className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                    disabled={currentPage === 1}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    title="Previous page"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+
+                  <span className="px-3 font-mono text-[11px] text-slate-200">
+                    Page {currentPage} of {totalPages}
+                  </span>
+
+                  <button
+                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                    disabled={currentPage === totalPages}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    title="Next page"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => setCurrentPage(totalPages)}
+                    disabled={currentPage === totalPages}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    title="Last page"
+                  >
+                    <ChevronsRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
+
           </div>
         )}
       </main>
@@ -1150,6 +1233,8 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                         <img
                           src={detailModalRow.product_image_url}
                           alt="Product"
+                          loading="lazy"
+                          decoding="async"
                           className="max-h-full max-w-full object-contain"
                         />
                       ) : (
@@ -1214,7 +1299,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                               className="h-16 rounded-lg bg-slate-900 border border-slate-800 hover:border-indigo-400 overflow-hidden cursor-pointer p-1 flex items-center justify-center transition hover:scale-105"
                               title={alt.title}
                             >
-                              <img src={alt.thumbnail_src || alt.img_src} alt="alt" className="max-h-full max-w-full object-contain" />
+                              <img src={alt.thumbnail_src || alt.img_src} alt="alt" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
                             </div>
                           ))}
                         </div>
@@ -1246,6 +1331,8 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                         <img
                           src={detailModalRow.variant_image_url}
                           alt="Variant"
+                          loading="lazy"
+                          decoding="async"
                           className="max-h-full max-w-full object-contain"
                         />
                       ) : (
@@ -1310,7 +1397,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                               className="h-16 rounded-lg bg-slate-900 border border-slate-800 hover:border-cyan-400 overflow-hidden cursor-pointer p-1 flex items-center justify-center transition hover:scale-105"
                               title={alt.title}
                             >
-                              <img src={alt.thumbnail_src || alt.img_src} alt="alt" className="max-h-full max-w-full object-contain" />
+                              <img src={alt.thumbnail_src || alt.img_src} alt="alt" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
                             </div>
                           ))}
                         </div>
