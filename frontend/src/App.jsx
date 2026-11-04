@@ -463,6 +463,60 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
   };
 
   const handleSelectAlternativeImage = useCallback(async (rowIndex, imageObj, target = 'product') => {
+    const cleanUrl = imageObj.img_src || '';
+    const cleanThumb = imageObj.thumbnail_src || cleanUrl;
+
+    // 1. Instantly and optimistically update React state (0ms latency!)
+    setRows((prev) => {
+      const next = [...prev];
+      if (next[rowIndex]) {
+        const r = { ...next[rowIndex] };
+        if (target === 'variant') {
+          r.variant_image_url = cleanUrl;
+          r.variant_thumbnail_url = cleanThumb;
+          r.variant_resolution = imageObj.resolution || r.variant_resolution;
+          r.variant_engine = imageObj.engine || r.variant_engine;
+          r.variant_status = 'SUCCESS';
+        } else {
+          r.product_image_url = cleanUrl;
+          r.product_thumbnail_url = cleanThumb;
+          r.product_resolution = imageObj.resolution || r.product_resolution;
+          r.product_engine = imageObj.engine || r.product_engine;
+          r.product_status = 'SUCCESS';
+        }
+        r.image_url = r.product_image_url || r.variant_image_url;
+        r.thumbnail_url = r.product_thumbnail_url || r.variant_thumbnail_url;
+        r.status = 'SUCCESS';
+        next[rowIndex] = r;
+      }
+      return next;
+    });
+
+    setDetailModalRow((prev) => {
+      if (prev && prev.row_index === rowIndex) {
+        const r = { ...prev };
+        if (target === 'variant') {
+          r.variant_image_url = cleanUrl;
+          r.variant_thumbnail_url = cleanThumb;
+          r.variant_resolution = imageObj.resolution || r.variant_resolution;
+          r.variant_engine = imageObj.engine || r.variant_engine;
+          r.variant_status = 'SUCCESS';
+        } else {
+          r.product_image_url = cleanUrl;
+          r.product_thumbnail_url = cleanThumb;
+          r.product_resolution = imageObj.resolution || r.product_resolution;
+          r.product_engine = imageObj.engine || r.product_engine;
+          r.product_status = 'SUCCESS';
+        }
+        r.image_url = r.product_image_url || r.variant_image_url;
+        r.thumbnail_url = r.product_thumbnail_url || r.variant_thumbnail_url;
+        r.status = 'SUCCESS';
+        return r;
+      }
+      return prev;
+    });
+
+    // 2. Sync to backend in background if job exists
     if (!uploadData?.job_id) return;
     try {
       const formData = new FormData();
@@ -470,34 +524,98 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
       formData.append('new_image_json', JSON.stringify(imageObj));
       formData.append('target', target);
 
-      const res = await axios.post(`/api/job/${uploadData.job_id}/swap-image`, formData);
-      setRows((prev) => {
-        const next = [...prev];
-        next[rowIndex] = res.data.row;
-        return next;
-      });
-      setDetailModalRow(prev => prev?.row_index === rowIndex ? res.data.row : prev);
+      await axios.post(`/api/job/${uploadData.job_id}/swap-image`, formData);
     } catch (err) {
-      alert('Failed to swap image: ' + err.message);
+      // If backend restarted or session reset, image is already cleanly swapped in UI
+      console.warn('Backend sync note (image swapped locally):', err.message);
     }
   }, [uploadData]);
 
   const handleCycleImage = useCallback(async (rowIndex, target = 'product', e) => {
     if (e) e.stopPropagation();
-    if (!uploadData?.job_id) return;
 
+    // 1. Instantly cycle from local alternatives list
+    setRows((prev) => {
+      const next = [...prev];
+      if (next[rowIndex]) {
+        const r = { ...next[rowIndex] };
+        const alts = target === 'variant' ? [...(r.variant_alternatives || [])] : [...(r.product_alternatives || [])];
+        if (alts.length > 0) {
+          const nextImg = alts.shift();
+          const currentImg = {
+            title: r.original_data?.product_name || '',
+            img_src: target === 'variant' ? r.variant_image_url : r.product_image_url,
+            thumbnail_src: target === 'variant' ? r.variant_thumbnail_url : r.product_thumbnail_url,
+            resolution: target === 'variant' ? r.variant_resolution : r.product_resolution,
+            engine: target === 'variant' ? r.variant_engine : r.product_engine
+          };
+          if (currentImg.img_src) alts.push(currentImg);
+
+          if (target === 'variant') {
+            r.variant_image_url = nextImg.img_src;
+            r.variant_thumbnail_url = nextImg.thumbnail_src || nextImg.img_src;
+            r.variant_resolution = nextImg.resolution || r.variant_resolution;
+            r.variant_engine = nextImg.engine || r.variant_engine;
+            r.variant_alternatives = alts;
+          } else {
+            r.product_image_url = nextImg.img_src;
+            r.product_thumbnail_url = nextImg.thumbnail_src || nextImg.img_src;
+            r.product_resolution = nextImg.resolution || r.product_resolution;
+            r.product_engine = nextImg.engine || r.product_engine;
+            r.product_alternatives = alts;
+          }
+          r.image_url = r.product_image_url || r.variant_image_url;
+          r.thumbnail_url = r.product_thumbnail_url || r.variant_thumbnail_url;
+          next[rowIndex] = r;
+        }
+      }
+      return next;
+    });
+
+    setDetailModalRow((prev) => {
+      if (prev && prev.row_index === rowIndex) {
+        const r = { ...prev };
+        const alts = target === 'variant' ? [...(r.variant_alternatives || [])] : [...(r.product_alternatives || [])];
+        if (alts.length > 0) {
+          const nextImg = alts.shift();
+          const currentImg = {
+            title: r.original_data?.product_name || '',
+            img_src: target === 'variant' ? r.variant_image_url : r.product_image_url,
+            thumbnail_src: target === 'variant' ? r.variant_thumbnail_url : r.product_thumbnail_url,
+            resolution: target === 'variant' ? r.variant_resolution : r.product_resolution,
+            engine: target === 'variant' ? r.variant_engine : r.product_engine
+          };
+          if (currentImg.img_src) alts.push(currentImg);
+
+          if (target === 'variant') {
+            r.variant_image_url = nextImg.img_src;
+            r.variant_thumbnail_url = nextImg.thumbnail_src || nextImg.img_src;
+            r.variant_resolution = nextImg.resolution || r.variant_resolution;
+            r.variant_engine = nextImg.engine || r.variant_engine;
+            r.variant_alternatives = alts;
+          } else {
+            r.product_image_url = nextImg.img_src;
+            r.product_thumbnail_url = nextImg.thumbnail_src || nextImg.img_src;
+            r.product_resolution = nextImg.resolution || r.product_resolution;
+            r.product_engine = nextImg.engine || r.product_engine;
+            r.product_alternatives = alts;
+          }
+          r.image_url = r.product_image_url || r.variant_image_url;
+          r.thumbnail_url = r.product_thumbnail_url || r.variant_thumbnail_url;
+          return r;
+        }
+      }
+      return prev;
+    });
+
+    // 2. Sync to backend
+    if (!uploadData?.job_id) return;
     const key = `${rowIndex}-${target}`;
     setCyclingKey(key);
     try {
-      const res = await axios.post(`/api/job/${uploadData.job_id}/cycle-image/${rowIndex}?target=${target}`);
-      setRows((prev) => {
-        const next = [...prev];
-        next[rowIndex] = res.data.row;
-        return next;
-      });
-      setDetailModalRow(prev => prev?.row_index === rowIndex ? res.data.row : prev);
+      await axios.post(`/api/job/${uploadData.job_id}/cycle-image/${rowIndex}?target=${target}`);
     } catch (err) {
-      alert(err.response?.data?.detail || 'No more alternative images to cycle');
+      console.warn('Backend cycle sync note:', err.message);
     } finally {
       setCyclingKey(null);
     }

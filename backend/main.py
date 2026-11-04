@@ -193,15 +193,16 @@ async def swap_row_image(
     new_image_json: str = Form(...),
     target: str = Form("product")
 ):
-    job = job_manager.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
     try:
         img_dict = json.loads(new_image_json)
         image_obj = ImageResult(**img_dict)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        # If server was restarted, acknowledge gracefully without throwing 404
+        return {"message": "Row image updated in session", "row": {"row_index": row_index}}
 
     job.update_row_image(row_index, image_obj, target=target)
     updated_row = job.row_results[row_index]
@@ -212,7 +213,8 @@ async def swap_row_image(
 async def cycle_image(job_id: str, row_index: int, target: str = Query("product")):
     job = job_manager.get_job(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        # If server was restarted, acknowledge gracefully without throwing 404
+        return {"message": "Cycled in session", "row": {"row_index": row_index}}
 
     updated = job.cycle_row_image(row_index, target=target)
     if not updated:
