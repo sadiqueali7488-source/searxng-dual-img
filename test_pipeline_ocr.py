@@ -47,3 +47,4 @@ async def run_test():
             print("   Alternatives count:", len(res_v["alternatives"]))
 
 asyncio.run(run_test())
+

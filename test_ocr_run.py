@@ -33,3 +33,4 @@ for line in result:
 print("\n--- DETECTED TEXT ON PACKET ---")
 for dt in detected_text:
     print(dt)
+

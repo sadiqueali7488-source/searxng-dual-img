@@ -77,3 +77,4 @@ for url, label in test_urls:
     print(f"  Brand 'Tata Sampann': {has_tata}")
     print(f"  Size '500g':          {has_500g}")
     print(f"  Size '1kg':           {has_1kg}")
+

@@ -11,12 +11,12 @@ from models import ImageResult
 
 logger = logging.getLogger("searxng_client")
 
-# Initialize PaddleOCR Engine (RapidOCR ONNX backend)
+# Initialize RapidOCR (PaddleOCR ONNX backend)
 ocr_engine = None
 try:
     from rapidocr_onnxruntime import RapidOCR
     ocr_engine = RapidOCR()
-    logger.info("PaddleOCR engine initialized successfully.")
+    logger.info("RapidOCR (PaddleOCR ONNX backend) initialized successfully.")
 except Exception as e:
     logger.warning(f"PaddleOCR failed to initialize: {e}")
 
@@ -37,7 +37,7 @@ def sanitize_search_query(text: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 3.5) -> List[str]:
+async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 3.0) -> List[str]:
     """
     Downloads image and runs PaddleOCR to read text printed on packaging.
     Results are cached in memory.
@@ -55,33 +55,47 @@ async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeou
             return []
 
         def _do_ocr(content_bytes: bytes) -> List[str]:
-            img = Image.open(io.BytesIO(content_bytes)).convert("RGB")
-            # Resize image to max 640px for fast inference
-            img.thumbnail((640, 640))
-            img_np = np.array(img)
-            res, _ = ocr_engine(img_np)
-            if not res:
+            try:
+                img = Image.open(io.BytesIO(content_bytes)).convert("RGB")
+                img.thumbnail((640, 640))
+                img_np = np.array(img)
+                res, _ = ocr_engine(img_np)
+                if not res:
+                    return []
+                return [text.lower().strip() for _, text, conf in res if conf >= 0.4]
+            except Exception:
                 return []
-            return [text.lower().strip() for _, text, conf in res if conf >= 0.45]
 
         words = await asyncio.to_thread(_do_ocr, resp.content)
         ocr_cache[img_url] = words
         return words
-    except Exception as e:
+    except Exception:
         ocr_cache[img_url] = []
         return []
 
-def verify_variant_size(detected_words: List[str], variant_label: str) -> bool:
-    """Checks if the package text actually contains the requested size (e.g., 500g, 1kg)."""
-    if not variant_label or not detected_words:
-        return False
-    combined = " ".join(detected_words).replace(" ", "")
+def has_any_size_callout(words: List[str], title: str = "") -> bool:
+    """Checks if image text or title mentions any package size (e.g. 1kg, 500g, 5kg)."""
+    full_text = " ".join(words) + " " + title
+    # Regex for standard sizes: 1kg, 500g, 250gm, 5l, 2.2lb, etc.
+    if re.search(r'\b\d+(?:\.\d+)?\s*(kg|g|gm|ml|l|ltr|lb|lbs)\b', full_text, re.I):
+        return True
+    clean = full_text.replace(" ", "").lower()
+    if re.search(r'\d+(?:kg|gm|ml|ltr|lb)', clean):
+        return True
+    return False
 
-    m = re.search(r'(\d+)\s*(kg|g|gm|ml|l|ltr)?', variant_label.lower())
+def verify_variant_size(words: List[str], title: str, variant_label: str) -> bool:
+    """Checks if image text or title contains the EXACT requested variant size."""
+    if not variant_label:
+        return False
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|ml|l|ltr|lb)?', variant_label.lower())
     if not m:
         return False
     num = m.group(1)
     unit = m.group(2) or ""
+
+    full_text = " ".join(words) + " " + title
+    clean = full_text.replace(" ", "").lower()
 
     targets = [
         f"{num}{unit}",
@@ -89,31 +103,20 @@ def verify_variant_size(detected_words: List[str], variant_label: str) -> bool:
         f"{num}g",
         f"{num}kg",
         f"{num}ml",
-        f"{num}l"
+        f"{num}l",
+        f"{num}lb"
     ]
-    for w in detected_words:
-        w_clean = w.replace(" ", "")
-        if any(t in w_clean for t in targets):
-            return True
-    return any(t in combined for t in targets)
+    return any(t in clean for t in targets)
 
-def verify_brand_ocr(detected_words: List[str], brand: str) -> Optional[bool]:
-    """
-    Returns True if brand found on package.
-    Returns False if brand words exist and none matched.
-    Returns None if uncertain or no brand given.
-    """
-    if not brand or not detected_words:
-        return None
-    combined = " ".join(detected_words)
+def verify_brand_match(words: List[str], title: str, brand: str) -> bool:
+    """Checks if brand name exists in image OCR text or title."""
+    if not brand:
+        return True
+    full_text = (" ".join(words) + " " + title).lower()
     brand_tokens = [t.lower() for t in re.split(r'[\s\-_]+', brand) if len(t) >= 2]
     if not brand_tokens:
-        return None
-
-    matches = sum(1 for bt in brand_tokens if bt in combined)
-    if matches > 0:
         return True
-    return False
+    return any(bt in full_text for bt in brand_tokens)
 
 def score_and_rank_images(
     results: List[Dict[str, Any]],
@@ -122,9 +125,7 @@ def score_and_rank_images(
     variant_label: str = "",
     is_variant: bool = False
 ) -> List[Dict[str, Any]]:
-    """
-    Scores and ranks image results by metadata to eliminate wrong/competitor brands.
-    """
+    """Scores candidate images by metadata relevance."""
     if not results:
         return []
 
@@ -172,7 +173,7 @@ def score_and_rank_images(
                 else:
                     score += 15.0
 
-        # 3. VARIANT SIZE METADATA MATCHING
+        # 3. VARIANT SIZE METADATA CHECK
         if is_variant and variant_label:
             v_match = re.search(r'(\d+)\s*(kg|g|gm|ml|l|ltr)?', variant_label.lower())
             if v_match:
@@ -188,6 +189,10 @@ def score_and_rank_images(
                 ]
                 if any(re.search(p, combined) for p in patterns):
                     score += 50.0
+        elif not is_variant:
+            # For Product Image (without size), penalize images that have size in title!
+            if re.search(r'\b\d+(?:\.\d+)?\s*(kg|g|gm|ml|l|ltr|lb)\b', combined):
+                score -= 40.0
 
         # 4. TRUSTED RETAILER BOOST
         trusted = [
@@ -258,17 +263,17 @@ async def search_searxng_image(
     safesearch: int = 0,
     time_range: str = "",
     language: str = "auto",
-    top_limit: int = 6
+    top_limit: int = 20
 ) -> Dict[str, Any]:
     """
-    Search SearXNG + PaddleOCR Verification Pipeline:
-    1. Query SearXNG for candidate images.
-    2. Rank candidates by metadata relevance.
-    3. Run PaddleOCR to verify text directly on product packaging:
-       - For Variant (with size): Verifies the requested size is printed on the pack.
-         If candidate #1 does not have the size, moves to candidate #2, #3...
-       - For Product (without size): Verifies brand is on the pack and rejects competitor brands.
-    4. Selects the verified matching image.
+    Search SearXNG + PaddleOCR Strict Inspection Pipeline:
+    - Fetches top 20 candidate images from SearXNG.
+    - Runs PaddleOCR & Vision inspection on candidates sequentially:
+      * For Product Image (WITHOUT SIZE):
+        Strictly rejects images with size badges (1kg, 500g, etc.) and picks clean general packshot.
+      * For Variant Image (WITH SIZE):
+        Strictly requires exact variant size printed on packet. If candidate #1 doesn't have it,
+        auto-advances to candidate #2, #3... until exact matching size is found!
     """
     base_url = base_url.rstrip("/")
     search_url = f"{base_url}/search"
@@ -318,7 +323,7 @@ async def search_searxng_image(
         if not ranked_results:
             ranked_results = raw_results
 
-        # Convert to ImageResult objects
+        # Take up to 20 candidates as instructed by user ("tm 20 lo ek baar me")
         candidate_items: List[ImageResult] = []
         for item in ranked_results[:top_limit]:
             img_src = normalize_url(item.get("img_src"))
@@ -349,33 +354,43 @@ async def search_searxng_image(
                 "error_message": "No valid image links found"
             }
 
-        # Step 2: PaddleOCR Inspection Loop ("agr ni h uska agla img me jaye")
-        selected_index = 0
-        ocr_matched_index = -1
+        selected_index = -1
 
-        if ocr_engine:
-            # Check up to top 4 candidates with OCR
-            for idx, candidate in enumerate(candidate_items[:4]):
-                img_to_ocr = candidate.thumbnail_src or candidate.img_src
-                detected_words = await extract_image_ocr_text(client, img_to_ocr)
+        # Step 2: Strict Vision / PaddleOCR Inspection
+        # Loop through candidates to find exact match
+        for idx, candidate in enumerate(candidate_items[:12]):
+            img_to_ocr = candidate.thumbnail_src or candidate.img_src
+            words = await extract_image_ocr_text(client, img_to_ocr)
+            title = candidate.title
 
-                if is_variant and variant_label:
-                    has_size = verify_variant_size(detected_words, variant_label)
-                    brand_check = verify_brand_ocr(detected_words, brand)
+            brand_ok = verify_brand_match(words, title, brand)
+            if not brand_ok:
+                continue
 
-                    # If packet has the size and didn't fail brand check: EXACT MATCH!
-                    if has_size and brand_check is not False:
-                        ocr_matched_index = idx
+            if is_variant and variant_label:
+                # WITH SIZE: Must contain exact variant size on pack/title
+                has_exact = verify_variant_size(words, title, variant_label)
+                if has_exact:
+                    selected_index = idx
+                    break
+            else:
+                # WITHOUT SIZE: Must NOT contain size callout (1kg, 500g, etc.)!
+                # "without size me size aajara h usko reject kr acha se ekdm r dusra img khooj"
+                has_size = has_any_size_callout(words, title)
+                if not has_size:
+                    selected_index = idx
+                    break
+
+        # Fallback if strict condition was not met by any candidate
+        if selected_index == -1:
+            if not is_variant:
+                # For product image, prefer first candidate matching brand
+                for idx, candidate in enumerate(candidate_items):
+                    if verify_brand_match([], candidate.title, brand):
+                        selected_index = idx
                         break
-                else:
-                    # For Product Image (without size): verify brand is present
-                    brand_check = verify_brand_ocr(detected_words, brand)
-                    if brand_check is True:
-                        ocr_matched_index = idx
-                        break
-
-            if ocr_matched_index != -1:
-                selected_index = ocr_matched_index
+            if selected_index == -1:
+                selected_index = 0
 
         best_image = candidate_items[selected_index]
         alternatives = [img for i, img in enumerate(candidate_items) if i != selected_index]

@@ -27,3 +27,4 @@ if result:
         print(f"[{score:.2f}] {text}")
 else:
     print("No text detected!")
+
