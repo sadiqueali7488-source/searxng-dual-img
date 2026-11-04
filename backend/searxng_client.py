@@ -210,24 +210,41 @@ def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") 
     return any(bt in full_text for bt in brand_tokens)
 
 def verify_product_keyword_match(words: List[str], title: str, product_name: str, url: str = "") -> bool:
-    """Ensures the core product noun matches (e.g. sattu != dal, besan != atta)."""
+    """Ensures the core product and all distinct sub-types / flavors match (e.g. beetroot, methi, sattu)."""
     if not product_name:
         return True
     full_text = (" ".join(words) + " " + title + " " + url).lower()
-    
+    p_lower = product_name.lower()
+
+    # 1. DISTINCTIVE FLAVOR / SUB-TYPE CHECK:
+    # If product name specifies a sub-type (like beetroot, methi, khapli, sattu, 7 grain):
+    distinctive_subtypes = [
+        'beetroot', 'methi', 'khapli', 'multigrain', '7 grain', '7grain', 'sharbati',
+        'ragi', 'sooji', 'suji', 'maida', 'besan', 'sattu', 'cornflour', 'corn flour',
+        'rock salt', 'black salt', 'kala namak', 'iodised', 'iodized', 'poha', 'dalia'
+    ]
+    for sub in distinctive_subtypes:
+        if sub in p_lower:
+            if sub in ['7 grain', '7grain']:
+                if not any(sg in full_text for sg in ['7 grain', '7grain', '7-grain']):
+                    return False
+            elif sub in ['cornflour', 'corn flour']:
+                if not any(cf in full_text for cf in ['cornflour', 'corn flour', 'corn starch']):
+                    return False
+            elif sub not in full_text:
+                return False
+
+    # 2. CORE CATEGORIES (e.g. sattu != dal, besan != atta)
     core_categories = [
         'sattu', 'besan', 'atta', 'maida', 'sooji', 'suji', 'rawa', 'flour', 
         'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee', 'sugar', 'salt', 
         'masala', 'cornflour', 'poha', 'dalia', 'noodles', 'pasta', 'biscuit',
         'cookies', 'paneer', 'butter', 'cheese', 'pickle', 'sauce', 'ketchup'
     ]
-    p_lower = product_name.lower()
     for cat in core_categories:
         if re.search(rf'\b{cat}\b', p_lower):
-            if cat == 'sattu':
-                return 'sattu' in full_text
-            if cat == 'cornflour':
-                return 'cornflour' in full_text or 'corn flour' in full_text or 'corn starch' in full_text
+            if cat == 'sattu' and 'sattu' not in full_text:
+                return False
             if cat in full_text:
                 return True
     return True
@@ -287,10 +304,16 @@ def score_and_rank_images(
             if pt in brand_tokens:
                 continue
             if pt in combined:
-                if pt in ['sattu', 'besan', 'atta', 'maida', 'sooji', 'flour', 'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee', 'sugar', 'salt', 'masala', 'cornflour', 'poha', 'dalia']:
+                if pt in ['beetroot', 'methi', 'khapli', 'ragi', 'sharbati', 'multigrain', '7grain']:
+                    score += 80.0
+                elif pt in ['sattu', 'besan', 'atta', 'maida', 'sooji', 'flour', 'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee', 'sugar', 'salt', 'masala', 'cornflour', 'poha', 'dalia']:
                     score += 45.0
                 else:
-                    score += 15.0
+                    score += 25.0
+            else:
+                # If a specific flavor/sub-type is completely missing from candidate, penalize heavily!
+                if pt in ['beetroot', 'methi', 'khapli', 'ragi', 'sharbati']:
+                    score -= 100.0
 
         # 3. VARIANT SIZE METADATA CHECK
         if is_variant and variant_label:
