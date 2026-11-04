@@ -371,17 +371,23 @@ class JobManager:
             if "brand_name" in clean_original_data:
                 clean_original_data["brand_name"] = brand
 
-            # Query 1: Product Image (WITHOUT SIZE) -> brand + prod_name
+            # Clean product name to remove any size badges (1kg, 500g, etc.) for Product Image query
+            clean_p_name = re.sub(r'\b\d+(?:\.\d+)?\s*(?:kg|g|gm|gms|ml|l|ltr|pack\s+of\s+\d+|pcs|pieces)\b', '', prod_name, flags=re.I)
+            clean_p_name = re.sub(r'\s+', ' ', clean_p_name).strip()
+            if not clean_p_name:
+                clean_p_name = prod_name
+
+            # Query 1: Product Image (WITHOUT SIZE) -> brand + clean_p_name
             p_parts = []
             if config.query_prefix:
                 p_parts.append(config.query_prefix.strip())
-            if brand and brand.lower() not in prod_name.lower():
+            if brand and brand.lower() not in clean_p_name.lower():
                 p_parts.append(brand)
-            if prod_name:
-                p_parts.append(prod_name)
+            if clean_p_name:
+                p_parts.append(clean_p_name)
             if config.query_suffix:
                 p_parts.append(config.query_suffix.strip())
-            product_query = sanitize_search_query(" ".join(p_parts).strip() or prod_name or brand or "product")
+            product_query = sanitize_search_query(" ".join(p_parts).strip() or clean_p_name or brand or "product")
 
             # Query 2: Variant Image (WITH SIZE) -> brand + prod_name + variant_label
             v_parts = []

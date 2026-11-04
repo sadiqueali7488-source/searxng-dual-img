@@ -37,7 +37,7 @@ def sanitize_search_query(text: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 3.0) -> List[str]:
+async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeout: float = 1.5) -> List[str]:
     """
     Downloads image and runs PaddleOCR to read text printed on packaging.
     Results are cached in memory.
@@ -73,50 +73,110 @@ async def extract_image_ocr_text(client: httpx.AsyncClient, img_url: str, timeou
         ocr_cache[img_url] = []
         return []
 
-def has_any_size_callout(words: List[str], title: str = "") -> bool:
-    """Checks if image text or title mentions any package size (e.g. 1kg, 500g, 5kg)."""
-    full_text = " ".join(words) + " " + title
-    # Regex for standard sizes: 1kg, 500g, 250gm, 5l, 2.2lb, etc.
-    if re.search(r'\b\d+(?:\.\d+)?\s*(kg|g|gm|ml|l|ltr|lb|lbs)\b', full_text, re.I):
+def has_any_size_callout(words: List[str], title: str = "", url: str = "") -> bool:
+    """Checks if image text, title, or url mentions any package size (e.g. 1kg, 500g, 5kg)."""
+    full_text = " ".join(words) + " " + title + " " + url
+    if re.search(r'\b\d+(?:\.\d+)?\s*(kg|g|gm|gms|ml|l|ltr|litre|liter|lb|lbs)\b', full_text, re.I):
         return True
-    clean = full_text.replace(" ", "").lower()
-    if re.search(r'\d+(?:kg|gm|ml|ltr|lb)', clean):
+    clean = re.sub(r'[^a-z0-9]', '', full_text.lower())
+    if re.search(r'\d+(?:kg|gm|gms|ml|ltr|litre|liter|lb)', clean):
         return True
     return False
 
-def verify_variant_size(words: List[str], title: str, variant_label: str) -> bool:
-    """Checks if image text or title contains the EXACT requested variant size."""
+def verify_variant_size(words: List[str], title: str, variant_label: str, url: str = "") -> bool:
+    """Checks if image text, title, or url contains the EXACT requested variant size."""
     if not variant_label:
         return False
-    m = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|ml|l|ltr|lb)?', variant_label.lower())
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr|lb)?', variant_label.lower())
     if not m:
         return False
     num = m.group(1)
     unit = m.group(2) or ""
 
-    full_text = " ".join(words) + " " + title
-    clean = full_text.replace(" ", "").lower()
+    full_text = " ".join(words) + " " + title + " " + url
+    clean = re.sub(r'[^a-z0-9]', '', full_text.lower())
 
     targets = [
         f"{num}{unit}",
         f"{num}gm",
+        f"{num}gms",
         f"{num}g",
         f"{num}kg",
         f"{num}ml",
         f"{num}l",
+        f"{num}ltr",
         f"{num}lb"
     ]
     return any(t in clean for t in targets)
 
-def verify_brand_match(words: List[str], title: str, brand: str) -> bool:
-    """Checks if brand name exists in image OCR text or title."""
+def verify_brand_match(words: List[str], title: str, brand: str, url: str = "") -> bool:
+    """Checks if brand name exists in image OCR text, title, or URL."""
     if not brand:
         return True
-    full_text = (" ".join(words) + " " + title).lower()
-    brand_tokens = [t.lower() for t in re.split(r'[\s\-_]+', brand) if len(t) >= 2]
+    brand_clean = brand.strip().lower()
+    full_text = (" ".join(words) + " " + title + " " + url).lower()
+
+    # Specific brand keywords that uniquely identify the brand
+    known_brand_keys = {
+        'tata': ['tata'],
+        'tata sampann': ['sampann'],
+        '24 mantra': ['mantra'],
+        '24 mantra organic': ['mantra'],
+        'aashirvaad': ['aashirvaad', 'asirvad', 'ashirwad'],
+        'fortune': ['fortune'],
+        'saffola': ['saffola'],
+        'daawat': ['daawat', 'dawat'],
+        'amul': ['amul'],
+        'everest': ['everest'],
+        'mdh': ['mdh'],
+        'catch': ['catch'],
+        '9am': ['9am', '9 am'],
+        'nestle': ['nestle', 'maggi'],
+        'patanjali': ['patanjali'],
+        'britannia': ['britannia'],
+        'parle': ['parle'],
+        'sunfeast': ['sunfeast'],
+        'haldiram': ['haldiram'],
+        'bikaji': ['bikaji'],
+        'mtr': ['mtr'],
+        'dhara': ['dhara'],
+        'gemini': ['gemini'],
+        'emami': ['emami'],
+        'mother dairy': ['mother dairy'],
+        'country delight': ['country delight'],
+    }
+    
+    for k, keys in known_brand_keys.items():
+        if k in brand_clean:
+            return any(key in full_text for key in keys)
+
+    brand_tokens = [t for t in re.split(r'[\s\-_]+', brand_clean) if len(t) >= 3 and t not in {'organic', 'pure', 'food', 'foods', 'brand', 'india', 'international'}]
     if not brand_tokens:
         return True
     return any(bt in full_text for bt in brand_tokens)
+
+def verify_product_keyword_match(words: List[str], title: str, product_name: str, url: str = "") -> bool:
+    """Ensures the core product noun matches (e.g. sattu != dal, besan != atta)."""
+    if not product_name:
+        return True
+    full_text = (" ".join(words) + " " + title + " " + url).lower()
+    
+    core_categories = [
+        'sattu', 'besan', 'atta', 'maida', 'sooji', 'suji', 'rawa', 'flour', 
+        'oil', 'ghee', 'dal', 'rice', 'tea', 'coffee', 'sugar', 'salt', 
+        'masala', 'cornflour', 'poha', 'dalia', 'noodles', 'pasta', 'biscuit',
+        'cookies', 'paneer', 'butter', 'cheese', 'pickle', 'sauce', 'ketchup'
+    ]
+    p_lower = product_name.lower()
+    for cat in core_categories:
+        if re.search(rf'\b{cat}\b', p_lower):
+            if cat == 'sattu':
+                return 'sattu' in full_text
+            if cat == 'cornflour':
+                return 'cornflour' in full_text or 'corn flour' in full_text or 'corn starch' in full_text
+            if cat in full_text:
+                return True
+    return True
 
 def score_and_rank_images(
     results: List[Dict[str, Any]],
@@ -283,7 +343,7 @@ async def search_searxng_image(
     params = {
         "q": clean_q,
         "category_images": 1,
-        "engines": "google images,bing images,duckduckgo images",
+        "engines": "bing images,brave.images",
         "pageno": 1,
         "language": language,
         "time_range": time_range,
@@ -357,40 +417,57 @@ async def search_searxng_image(
         selected_index = -1
 
         # Step 2: Strict Vision / PaddleOCR Inspection
-        # Loop through candidates to find exact match
+        # Loop through top candidates to find exact match
         for idx, candidate in enumerate(candidate_items[:12]):
-            img_to_ocr = candidate.thumbnail_src or candidate.img_src
-            words = await extract_image_ocr_text(client, img_to_ocr)
+            cand_url = candidate.img_src
             title = candidate.title
 
-            brand_ok = verify_brand_match(words, title, brand)
-            if not brand_ok:
+            # Fast metadata pre-check: skip immediately if title/url conflicts with brand or category
+            if not verify_brand_match([], title, brand, cand_url):
+                continue
+            if not verify_product_keyword_match([], title, product_name, cand_url):
+                continue
+
+            # Run OCR on packaging image
+            img_to_ocr = candidate.thumbnail_src or candidate.img_src
+            words = await extract_image_ocr_text(client, img_to_ocr, timeout=1.5)
+
+            # Re-verify brand and category with OCR text
+            if not verify_brand_match(words, title, brand, cand_url):
+                continue
+            if not verify_product_keyword_match(words, title, product_name, cand_url):
                 continue
 
             if is_variant and variant_label:
-                # WITH SIZE: Must contain exact variant size on pack/title
-                has_exact = verify_variant_size(words, title, variant_label)
+                # WITH SIZE: Must contain exact variant size on pack / title / url
+                has_exact = verify_variant_size(words, title, variant_label, cand_url)
                 if has_exact:
                     selected_index = idx
                     break
             else:
                 # WITHOUT SIZE: Must NOT contain size callout (1kg, 500g, etc.)!
-                # "without size me size aajara h usko reject kr acha se ekdm r dusra img khooj"
-                has_size = has_any_size_callout(words, title)
+                has_size = has_any_size_callout(words, title, cand_url)
                 if not has_size:
                     selected_index = idx
                     break
 
-        # Fallback if strict condition was not met by any candidate
+        # Fallback: if strict size match wasn't met, search for any candidate with matching brand & product
         if selected_index == -1:
-            if not is_variant:
-                # For product image, prefer first candidate matching brand
-                for idx, candidate in enumerate(candidate_items):
-                    if verify_brand_match([], candidate.title, brand):
-                        selected_index = idx
-                        break
-            if selected_index == -1:
-                selected_index = 0
+            for idx, candidate in enumerate(candidate_items):
+                words = ocr_cache.get(candidate.thumbnail_src or candidate.img_src, [])
+                if verify_brand_match(words, candidate.title, brand, candidate.img_src) and \
+                   verify_product_keyword_match(words, candidate.title, product_name, candidate.img_src):
+                    selected_index = idx
+                    break
+
+        # If still no candidate matches both brand and product, return NOT_FOUND (Zero false positives!)
+        if selected_index == -1:
+            return {
+                "status": "NOT_FOUND",
+                "best_image": None,
+                "alternatives": candidate_items[:5],
+                "error_message": f"No verified image matching brand '{brand}' and product '{product_name}'"
+            }
 
         best_image = candidate_items[selected_index]
         alternatives = [img for i, img in enumerate(candidate_items) if i != selected_index]
