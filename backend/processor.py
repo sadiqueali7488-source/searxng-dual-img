@@ -21,6 +21,64 @@ PRODUCT_MASTER_30_COLUMNS = [
     'variant_images'
 ]
 
+# Column-name synonyms (compared after lower-casing and removing spaces/_/-), in priority order.
+# Lets any Excel work: "Item Name", "PRODUCT NAME", "Company", "Pack Size", "Net Wt"...
+PRODUCT_COLUMN_NAMES = [
+    'productname', 'product', 'productitle', 'producttitle', 'itemname', 'item', 'itemdescription',
+    'name', 'title', 'skuname', 'articlename', 'article', 'description', 'productdescription',
+]
+BRAND_COLUMN_NAMES = [
+    'brandname', 'brand', 'brands', 'manufacturer', 'manufacturername', 'mfr', 'company', 'companyname',
+    'make', 'maker', 'marketedby', 'vendor', 'vendorname', 'label',
+]
+VARIANT_COLUMN_NAMES = [
+    'variantlabel', 'variant', 'variantname', 'size', 'packsize', 'packingsize', 'packetsize', 'pack',
+    'weight', 'netweight', 'netwt', 'netqty', 'netquantity', 'volume', 'netvolume', 'grammage',
+    'uom', 'unit', 'quantity', 'qty',
+]
+# Columns that hold a stock count / price for some sheets: only used if their values look like sizes
+_AMBIGUOUS_VARIANT_NAMES = {'quantity', 'qty', 'unit', 'uom', 'pack'}
+_SIZE_VALUE_RE = re.compile(r'\d\s*(?:kg|g|gm|gms|gram|grams|mg|ml|l|ltr|litre|liter|lb|oz|pcs|pc|xs|s|m|xl|xxl)\b', re.I)
+
+def _norm_col(name: Any) -> str:
+    return re.sub(r'[^a-z0-9]', '', str(name).lower())
+
+def _find_column(columns: List[str], names: List[str], contains: List[str], exclude: Optional[set] = None) -> str:
+    exclude = exclude or set()
+    normed = {c: _norm_col(c) for c in columns if c not in exclude}
+    for n in names:                                   # 1. exact synonym, in priority order
+        for col, nc in normed.items():
+            if nc == n:
+                return col
+    for col, nc in normed.items():                    # 2. name contains a keyword ("Brand Name (EN)")
+        if any(k in nc for k in contains):
+            return col
+    return ""
+
+def detect_columns(df: pd.DataFrame, product_hint: str = "") -> Dict[str, str]:
+    """Finds the product, brand and size columns of any sheet. Returns '' for a column that isn't there."""
+    columns = [str(c) for c in df.columns]
+    product = product_hint if product_hint in columns else _find_column(columns, PRODUCT_COLUMN_NAMES, ['productname', 'producttitle', 'itemname', 'itemtitle'])
+    brand = _find_column(columns, BRAND_COLUMN_NAMES, ['brand', 'manufactur'], exclude={product})
+
+    variant = ""
+    for n in VARIANT_COLUMN_NAMES:
+        for col in columns:
+            if col in (product, brand) or _norm_col(col) != n:
+                continue
+            if n in _AMBIGUOUS_VARIANT_NAMES:
+                # "Qty" may be a stock count: accept it only if most values look like 500g / 1L / XL
+                sample = [str(v) for v in df[col].head(200).tolist() if str(v).strip() and str(v).lower() != "nan"]
+                if not sample or sum(bool(_SIZE_VALUE_RE.search(v)) for v in sample) < 0.5 * len(sample):
+                    continue
+            variant = col
+            break
+        if variant:
+            break
+    if not variant:
+        variant = _find_column(columns, [], ['variant', 'packsize', 'weight', 'size'], exclude={product, brand})
+    return {"product": product, "brand": brand, "variant": variant}
+
 def clean_brand(brand: Any, prod_name: str = "") -> str:
     b = "" if brand is None else str(brand).strip()
     if b.lower() == "nan":
@@ -111,6 +169,8 @@ class SearchJob:
 
         self.df = df
         self.original_columns = list(df.columns)
+        # Product / brand / size columns, whatever the sheet calls them (refined with the chosen query column on start)
+        self.columns = detect_columns(df)
         self.config: Optional[SearchConfig] = None
         self.status = JobStatus(job_id=job_id, filename=filename, total_rows=len(df))
         self.row_results: List[RowResult] = []
@@ -121,6 +181,15 @@ class SearchJob:
         self.listeners: List[asyncio.Queue] = []
         self.task: Optional[asyncio.Task] = None
         self.start_time: float = 0.0
+
+    def row_values(self, orig: Dict[str, Any]) -> tuple:
+        """(brand, product name, size) of one row, read from the detected columns."""
+        def get(kind: str) -> str:
+            col = self.columns.get(kind)
+            val = str(orig.get(col, "")).strip() if col else ""
+            return "" if val.lower() == "nan" else val
+        product = get("product")
+        return clean_brand(get("brand"), product), product, get("variant")
 
     def add_listener(self) -> asyncio.Queue:
         q = asyncio.Queue()
@@ -233,9 +302,7 @@ class SearchJob:
             language = self.config.language if self.config else "auto"
 
             orig = row.original_data or {}
-            brand_val = orig.get("brand_name") or orig.get("brand") or orig.get("Brand") or orig.get("BRAND") or orig.get("Brand Name") or orig.get("Manufacturer") or ""
-            prod_val = orig.get("product_name") or orig.get("Product Name") or orig.get("product") or orig.get("Product") or ""
-            var_val = orig.get("variant_label") or orig.get("variant") or orig.get("Variant") or orig.get("size") or orig.get("Size") or orig.get("pack_size") or orig.get("Pack Size") or orig.get("PACK SIZE") or orig.get("weight") or orig.get("Weight") or ""
+            brand_val, prod_val, var_val = self.row_values(orig)
 
             # 1. Search Product Image (Without Size)
             if target in ["both", "product"]:
@@ -326,6 +393,8 @@ class JobManager:
             raise ValueError(f"Job {job_id} not found")
 
         job.config = config
+        # The column the user picked as the product name is also the one the checks verify against
+        job.columns = detect_columns(job.df, product_hint=config.query_column)
         job.status.state = "running"
         job.is_paused = False
         job.is_cancelled = False
@@ -350,29 +419,7 @@ class JobManager:
             }
 
             prod_name = clean_original_data.get(config.query_column, "").strip()
-            brand = (
-                clean_original_data.get("brand_name") or
-                clean_original_data.get("brand") or
-                clean_original_data.get("Brand") or
-                clean_original_data.get("BRAND") or
-                clean_original_data.get("Brand Name") or
-                clean_original_data.get("brand name") or
-                clean_original_data.get("Manufacturer") or ""
-            ).strip()
-            brand = clean_brand(brand, prod_name)
-
-            variant = (
-                clean_original_data.get("variant_label") or
-                clean_original_data.get("variant") or
-                clean_original_data.get("Variant") or
-                clean_original_data.get("size") or
-                clean_original_data.get("Size") or
-                clean_original_data.get("pack_size") or
-                clean_original_data.get("Pack Size") or
-                clean_original_data.get("PACK SIZE") or
-                clean_original_data.get("weight") or
-                clean_original_data.get("Weight") or ""
-            ).strip()
+            brand, _, variant = job.row_values(clean_original_data)
 
             if "brand_name" in clean_original_data:
                 clean_original_data["brand_name"] = brand
@@ -475,9 +522,7 @@ class JobManager:
                     await asyncio.sleep(config.delay_ms / 1000.0)
 
                 orig_row = row_res.original_data or {}
-                b_val = orig_row.get("brand_name") or orig_row.get("brand") or orig_row.get("Brand") or orig_row.get("BRAND") or orig_row.get("Brand Name") or orig_row.get("Manufacturer") or ""
-                p_val = orig_row.get("product_name") or orig_row.get("Product Name") or orig_row.get("product") or orig_row.get("Product") or ""
-                v_val = orig_row.get("variant_label") or orig_row.get("variant") or orig_row.get("Variant") or orig_row.get("size") or orig_row.get("Size") or orig_row.get("pack_size") or orig_row.get("Pack Size") or orig_row.get("PACK SIZE") or orig_row.get("weight") or orig_row.get("Weight") or ""
+                b_val, p_val, v_val = job.row_values(orig_row)
 
                 # 1. Product Image (Without Size) and 2. Variant Image (With Size):
                 # separate independent searches and inspections, run side by side
