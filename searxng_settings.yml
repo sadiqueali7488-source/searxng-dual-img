@@ -27,6 +27,11 @@ engines:
     disabled: false
     timeout: 8.0
 
+  # Second index for hard rows (UK / EU Indian grocers, quick-commerce, regional brands)
+  - name: yandex images
+    disabled: false
+    timeout: 8.0
+
   - name: duckduckgo images
     engine: duckduckgo_extra
     shortcut: ddi

@@ -47,6 +47,9 @@ RELAXED_MAX = 10
 RELAXED_MIN_FRONT = 0.5
 RELAXED_MIN_MATCH = 0.27
 RELAXED_MAX_MULTIPLE = 0.3
+#  - LOOSE: very last resort (row would be empty): brand named by the listing, one product word matches
+LOOSE_REJECTS = SOFT_REJECTS | {"listing_no_size"}
+LOOSE_MIN_MATCH = 0.24
 # Image <-> "a photo of <product> product package": right product 0.36-0.45, a different product 0.24
 VISION_MIN_MATCH = 0.27
 # Embedding similarity: same photo 1.0, same product other photo ~0.7, different products 0.42-0.48
@@ -54,6 +57,15 @@ SAME_PHOTO_SIMILARITY = 0.92
 SAME_PACK_SIMILARITY = 0.6
 # Max candidates screened (fast OCR + vision) per search attempt
 MAX_SCREENED = 12
+# Text rejects worth a second read by the accurate OCR when vision sees one front pack
+TEXT_REJECTS = {"not_front", "brand", "product_words", "product_not_on_pack"}
+MAX_SECOND_LOOKS = 4
+SECOND_LOOK_FRONT = 0.6
+# Image engines (a suspended engine answers empty at once). The main engines answer every attempt;
+# the extra engines (Yandex: UK / EU Indian grocers, Blinkit, regional brands) get their own attempts
+# when the main engines found no exact image, so their results never push good main results out.
+IMAGE_ENGINES = [e.strip() for e in os.environ.get("IMAGE_ENGINES", "google images,bing images").split(",") if e.strip()]
+EXTRA_IMAGE_ENGINES = [e.strip() for e in os.environ.get("EXTRA_IMAGE_ENGINES", "yandex images").split(",") if e.strip()]
 
 # Images OCR'd at the same time per search (the OCR pool runs them in parallel)
 OCR_BATCH = 4
@@ -104,7 +116,7 @@ def is_banner_or_composite(words: List[str], brand: str = "") -> bool:
 
 # Part of every search-cache key: bump it whenever the selection rules change, so results chosen
 # under older (weaker) rules are never served from the cache again
-SEARCH_RULES_VERSION = "rules-18"
+SEARCH_RULES_VERSION = "rules-21"
 # Part of every OCR-cache key: bump when ocr_engine returns new fields
 OCR_CACHE_VERSION = "v3"
 
@@ -310,6 +322,51 @@ CORPORATE_WORDS = {
     'india', 'indian', 'corporation', 'corp', 'inc', 'group', 'agro', 'mills', 'trading', 'traders', 'brands',
 }
 
+def _edit1(a: str, b: str) -> bool:
+    """a and b differ by at most one inserted, deleted or changed letter."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    i = 0
+    while i < la and a[i] == b[i]:
+        i += 1
+    return a[i + 1:] == b[i + 1:] if la == lb else a[i:] == b[i + 1:]
+
+def _near_in(token: str, compact: str) -> bool:
+    """token appears in compact OCR text with at most one letter wrong."""
+    n = len(token)
+    for size in (n - 1, n, n + 1):
+        for i in range(0, len(compact) - size + 1):
+            if _edit1(token, compact[i:i + size]):
+                return True
+    return False
+
+# Parent companies whose packs print only the product brand ('Perfetti' row -> 'Chupa Chups' pack)
+PARENT_BRANDS = {
+    "perfetti": ["chupa chups", "mentos", "alpenliebe", "centerfruit", "center fruit", "centre fruit",
+                 "center fresh", "centre fresh", "happydent", "big babol", "fruittella", "chloromint", "marbels"],
+    "mondelez": ["cadbury", "oreo", "bournvita", "toblerone", "tang"],
+    "nestle": ["maggi", "kitkat", "kit kat", "munch", "milkybar", "nescafe", "polo", "everyday", "a+"],
+    "ferrero": ["kinder", "nutella", "tic tac", "ferrero rocher", "rocher"],
+    "mars": ["snickers", "galaxy", "bounty", "twix", "m&m", "skittles"],
+    "itc": ["aashirvaad", "sunfeast", "bingo", "yippee", "candyman", "fabelle", "mint-o", "mint o"],
+}
+
+def effective_brand(brand: str, product_name: str) -> str:
+    """The brand printed on the pack: the product brand when the Excel names only the parent company."""
+    key = re.sub(r'[^a-z0-9]', '', fold(brand or '').lower())
+    for parent, subs in PARENT_BRANDS.items():
+        if key == parent or key.startswith(parent):
+            name = f" {re.sub(r'[^a-z0-9&+]+', ' ', fold(product_name or '').lower())} "
+            for sb in sorted(subs, key=len, reverse=True):
+                if f" {sb} " in name:
+                    return sb.title()
+    return brand
+
 def brand_evidence(words: List[str], brand: str) -> str:
     """
     How clearly the brand is printed on the pack:
@@ -339,6 +396,9 @@ def brand_evidence(words: List[str], brand: str) -> str:
                 return "strong"
     distinctive = [t for t in tokens if len(t) >= 5 and t not in GENERIC_BRAND_WORDS]
     if any(t in compact for t in distinctive):
+        return "strong"
+    # stylised logos: OCR drops or swaps one letter ('udaiyam' for 'Udhaiyam'); long words only
+    if any(len(t) >= 6 and _near_in(t, compact) for t in distinctive):
         return "strong"
     long_tokens = [t for t in tokens if len(t) >= 4]
     main = max([t for t in long_tokens if t not in GENERIC_BRAND_WORDS] or long_tokens, key=len, default="")
@@ -501,6 +561,8 @@ def has_variant_conflict(title: str, words: List[str], product_name: str, brand:
     ocr = " ".join(words or []).lower()
     if has_process_conflict(name, f"{t} {ocr}"):
         return True
+    if has_pulse_conflict(name, f"{t} {ocr}"):
+        return True   # the pack prints Besan / Chana, the row is Toor Dal: shop titles lie
     # Special / seasonal editions are other products unless the Excel name says so
     # (OCR runs script words together: 'heartblush', 'aremy' = "you are my love")
     name_c = re.sub(r'[^a-z0-9]', '', name)
@@ -585,6 +647,41 @@ GRAIN_ALIAS_GROUPS = [
     ['kabuli', 'chickpeas'], ['sooji', 'suji', 'rava', 'semolina'], ['besan', 'gram flour'],
     ['steam', 'steamed'], ['parboiled', 'boiled'],
 ]
+
+# Which pulse / flour it is. Generic words ('lentil', 'dal', 'gram') are left out on purpose.
+PULSE_GROUPS = [
+    ['toor', 'tur dal', 'tuvar', 'toovar', 'arhar'], ['chana', 'bengal gram', 'chickpea'], ['moong', 'mung', 'green gram'],
+    ['urad', 'black gram'], ['masoor', 'red lentil'], ['rajma', 'kidney bean'], ['besan', 'gram flour'],
+    ['sooji', 'suji', 'rava', 'semolina'], ['ragi', 'nachni', 'finger millet'], ['jowar', 'sorghum'],
+    ['bajra', 'pearl millet'], ['poha', 'flattened rice'], ['maida'], ['kulthi', 'horse gram', 'kollu'],
+    ['matar', 'watana', 'vatana', 'green peas', 'white peas'], ['salt', 'namak'], ['pepper', 'kali mirch'],
+    ['til', 'sesame'], ['jaggery', 'gur', 'gud'],
+]
+
+def _pulse_groups_in(text: str) -> set:
+    # links run words together ('roasted-soojirava'): split on every non-letter AND camel / joined words stay
+    t = f" {re.sub(r'[^a-z0-9]+', ' ', fold(text or '').lower())} "
+    return {i for i, g in enumerate(PULSE_GROUPS) if any(f" {w} " in t for w in g)}
+
+FILLER_WORDS = {'with', 'and', 'for', 'the', 'from', 'made', 'new', 'pure'}
+
+def _word_hit(t: str, compact: str) -> bool:
+    """t is printed / named: also its singular ('multigrains' -> 'multigrain') or a local name ('tur' / 'arhar')."""
+    if t in compact or (len(t) > 4 and t.endswith('s') and t[:-1] in compact):
+        return True
+    for group in GRAIN_ALIAS_GROUPS:
+        g = [re.sub(r'[^a-z0-9]', '', a) for a in group]
+        if t in g and any(a in compact for a in g):
+            return True
+    return False
+
+def has_pulse_conflict(name: str, ocr: str) -> bool:
+    """The pack PRINTS another pulse / flour and never this one (Fine Besan pack for 'Toor Dal')."""
+    want = _pulse_groups_in(name)
+    if not want or not ocr:
+        return False
+    got = _pulse_groups_in(ocr)
+    return bool(got - want) and not (got & want)
 
 def has_specialty_flour_conflict(target_prod: str, cand_text: str) -> bool:
     """
@@ -837,6 +934,15 @@ _UNIT_TO_BASE = {
     'liter': ('vol', 1000), 'ml': ('vol', 1),
 }
 _SIZE_RE = re.compile(r'(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(kgs?|grams?|gms?|gm|g|ltr|litre|liter|l|ml)(?![a-z])')
+
+def _meta_shows_only_other_size(meta: str, variant_label: str) -> bool:
+    """The listing title / link names a size of the same kind (weight / volume), and never the row's size."""
+    want = _parse_sizes(variant_label)
+    if not want:
+        return False
+    dims = {d for d, _ in want}
+    got = {s for s in _parse_sizes(meta) if s[0] in dims}
+    return bool(got) and not (got & want)
 
 def _parse_sizes(text: str) -> set:
     """'1 Kg' -> {('mass', 1000.0)}; '500 ml' -> {('vol', 500.0)}."""
@@ -1462,23 +1568,31 @@ async def _search_uncached(
     If no attempt is exact, the best fallback (right brand + product front) from any attempt is used.
     """
     brand, product_name, variant_label = fold(brand), fold(product_name), fold(variant_label)
+    brand = effective_brand(brand, product_name)
     clean_q = sanitize_search_query(fold(query))
     plain_q = _strip_suffix(clean_q) or clean_q
-    attempts: List[Tuple[List[str], int]] = [([trusted_query(plain_q), clean_q], 1)]
+    main, extra_eng = IMAGE_ENGINES, EXTRA_IMAGE_ENGINES
+    attempts: List[Tuple[List[str], int, List[str]]] = [([trusted_query(plain_q), clean_q], 1, main)]
     if plain_q.lower() != clean_q.lower():
-        attempts.append(([plain_q], 1))
-    attempts.append(([plain_q], 2))
+        attempts.append(([plain_q], 1, main))
+    if extra_eng:
+        attempts.append(([plain_q], 1, extra_eng))   # another index: shops the main engines miss
+    attempts.append(([plain_q], 2, main))
     if deep:
-        attempts.append(([plain_q], 3))
-        spaced = re.sub(r'(\d)(kg|g|gm|ml|l|ltr)', r' ', plain_q, flags=re.I)
+        attempts.append(([plain_q], 3, main))
+        if extra_eng:
+            attempts.append(([plain_q], 2, extra_eng))
+        spaced = re.sub(r'(\d)(kg|g|gm|ml|l|ltr)\b', r'\1 \2', plain_q, flags=re.I)
         if spaced != plain_q:
-            attempts.append(([spaced], 1))
+            attempts.append(([spaced], 1, main))
     # Hard rows only (nothing verified yet): simpler wording finds listings the full name misses,
     # and for the variant the size-free search finds the other sizes of this product (nearest size)
-    extra: List[Tuple[List[str], int]] = []
+    extra: List[Tuple[List[str], int, List[str]]] = []
     for q in simplified_queries(brand, product_name, variant_label if is_variant else ""):
         if q.lower() not in {plain_q.lower(), clean_q.lower()}:
-            extra.append(([q], 1))
+            extra.append(([q], 1, main))
+            if extra_eng:
+                extra.append(([q], 1, extra_eng))
 
     seen: set = set(u for u in (exclude or []) if u)
     excluded = frozenset(photo_key(u) for u in (exclude or []) if u)
@@ -1488,12 +1602,12 @@ async def _search_uncached(
     errors: List[str] = []
     all_reasons: Dict[str, str] = {}
     tried = 0
-    for n, (queries, page) in enumerate(attempts + extra):
+    for n, (queries, page, engines) in enumerate(attempts + extra):
         if n >= len(attempts) and fallback_result is not None and not (is_variant and variant_label):
             break   # extra attempts: rows with nothing verified, or a variant without its exact size yet
         tried += 1
         res = await _search_once(client, base_url, queries, page, brand, product_name, variant_label,
-                                 is_variant, safesearch, time_range, language, top_limit, seen, excluded)
+                                 is_variant, safesearch, time_range, language, top_limit, seen, excluded, engines)
         all_reasons.update(res.get("reject_reasons") or {})
         if res["status"] == "ERROR":
             errors.append(res.get("error_message") or "error")
@@ -1503,7 +1617,7 @@ async def _search_uncached(
         if res["status"] == "SUCCESS" and (m == "exact" or (not is_variant and res.get("clean"))):
             res["alternatives"] = (res["alternatives"] + extra_alts)[:MAX_ALTERNATIVES]
             return res
-        if res["status"] == "SUCCESS" and m in ("nearest", "relaxed"):
+        if res["status"] == "SUCCESS" and m in ("nearest", "relaxed", "loose"):
             last_tier.setdefault(m, res)
             extra_alts.extend(res.get("alternatives", []))
         elif res["status"] == "SUCCESS" and fallback_result is None:
@@ -1512,7 +1626,7 @@ async def _search_uncached(
             extra_alts.extend(res.get("alternatives", []))
 
     # verified fallback > nearest size of this product > relaxed (vision-confirmed) pick
-    best = fallback_result or last_tier.get("nearest") or last_tier.get("relaxed")
+    best = fallback_result or last_tier.get("nearest") or last_tier.get("relaxed") or last_tier.get("loose")
     if best:
         best["alternatives"] = (best["alternatives"] + extra_alts)[:MAX_ALTERNATIVES]
         return best
@@ -1606,37 +1720,50 @@ def simplified_queries(brand: str, product_name: str, size: str = "") -> List[st
     return out
 
 async def _fetch_image_results(client: httpx.AsyncClient, base_url: str, q: str, page: int,
-                               language: str, time_range: str, safesearch: int) -> Tuple[Optional[List[Dict[str, Any]]], str]:
-    """One SearXNG image query: Google Images first, Bing Images if Google is blocked. (results | None, error)."""
+                               language: str, time_range: str, safesearch: int,
+                               engines: Optional[List[str]] = None) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """
+    One SearXNG image query over every working image engine at once (results | None, error):
+    Google (when SearXNG is not blocked by it), Bing and Yandex. Yandex indexes many shops Bing misses
+    (UK / EU Indian grocers, Blinkit, regional brands), so hard rows get far more candidates.
+    Results of the engines are interleaved, so one engine's junk never pushes out the other's hits.
+    """
     search_url = f"{pick_searxng(base_url)}/search"
     params = {
         "q": q,
-        "category_images": 1,
-        "engines": "google images",
         "pageno": page,
         "language": language,
         "time_range": time_range,
         "safesearch": safesearch,
         "format": "json"
     }
-    try:
-        resp_g = await client.get(search_url, params=params)
-        if resp_g.status_code == 200:
-            results = resp_g.json().get("results", [])
-            if results:
-                return results, ""
-    except Exception:
-        pass
-    # Resilient Fallback: Google Images temporarily blocked/suspended by SearXNG -> Bing Images
-    try:
-        resp_fb = await client.get(search_url, params={**params, "engines": "bing images"})
-        if resp_fb.status_code == 200:
-            return resp_fb.json().get("results", []), ""
-        return None, f"HTTP {resp_fb.status_code}: {resp_fb.text[:120]}"
-    except httpx.TimeoutException:
-        return None, "SearXNG request timed out"
-    except Exception as e:
-        return None, str(e) or type(e).__name__
+
+    async def one(engine: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        try:
+            resp = await client.get(search_url, params={**params, "engines": engine})
+            if resp.status_code == 200:
+                return resp.json().get("results", []), ""
+            return None, f"HTTP {resp.status_code}: {resp.text[:120]}"
+        except httpx.TimeoutException:
+            return None, "SearXNG request timed out"
+        except Exception as e:
+            return None, str(e) or type(e).__name__
+
+    got = await asyncio.gather(*(one(e) for e in (engines or IMAGE_ENGINES)))
+    lists = [r for r, _ in got if r]
+    if not lists:
+        errs = [e for _, e in got if e]
+        return (None, errs[0]) if errs and len(errs) == len(got) else ([], "")
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for k in range(max(len(l) for l in lists)):
+        for l in lists:
+            if k < len(l):
+                src = l[k].get("img_src") or ""
+                if src and src not in seen:
+                    seen.add(src)
+                    merged.append(l[k])
+    return merged, ""
 
 async def _search_once(
     client: httpx.AsyncClient,
@@ -1652,7 +1779,8 @@ async def _search_once(
     language: str,
     top_limit: int,
     seen: set,
-    excluded: frozenset = frozenset()
+    excluded: frozenset = frozenset(),
+    engines: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Search SearXNG + two-stage PP-OCRv6 Strict Inspection Pipeline:
@@ -1671,7 +1799,7 @@ async def _search_once(
         # All queries of this attempt run in parallel; results are merged in query order
         # (trusted-store results first), duplicates removed
         fetched = await asyncio.gather(*(
-            _fetch_image_results(client, base_url, q, page, language, time_range, safesearch) for q in queries
+            _fetch_image_results(client, base_url, q, page, language, time_range, safesearch, engines) for q in queries
         ))
         raw_results: List[Dict[str, Any]] = []
         merged_src: set = set()
@@ -1844,6 +1972,9 @@ async def _search_once(
             # WITHOUT SIZE: a pack (or caption) printing another size ("Moong Dhall 100 g" for the 1 kg row) is wrong
             if variant_label and _ocr_shows_other_size(words, variant_label):
                 return rej(cand_url, "product_other_size")
+            if variant_label and _meta_shows_only_other_size(f"{title} {cand_url}", variant_label):
+                # tiny print OCR misses ('5 kg' in a corner): the listing is the 5 kg pack, not this 1 kg row
+                return rej(cand_url, "product_other_size")
             if listing_only:
                 return "fallback"   # a pack with the product name printed on it is preferred
             # WITHOUT SIZE: prefer a clean pack without a size callout (1kg, 500g, etc.)
@@ -1888,6 +2019,22 @@ async def _search_once(
                 # repeated texture: one bag with a pattern, or several packs? vision decides
                 vision_map[cand_url] = await read_vision(client, cand_url, candidate.thumbnail_src, product_text)
             verdict = judge(candidate, first, meta_ok)
+            if verdict == "reject" and reject_reasons.get(cand_url) in TEXT_REJECTS and second_looks[0] < MAX_SECOND_LOOKS:
+                # The fast model garbles stylised logos ('udhhihdddnm' for UDHAIYAM). When vision sees one
+                # front pack, the accurate model reads it again and the rules judge what it read.
+                vis = vision_map.get(cand_url) or await read_vision(client, cand_url, candidate.thumbnail_src, product_text)
+                vision_map[cand_url] = vis
+                if vis and vis.get("kinds", {}).get("front_single", 0.0) >= SECOND_LOOK_FRONT:
+                    second_looks[0] += 1
+                    second = await read_image(client, cand_url, candidate.thumbnail_src, "strict")
+                    if second["words"]:
+                        reason = reject_reasons.pop(cand_url, None)
+                        merged = {**first, "words": list(first["words"]) + list(second["words"]),
+                                  "repeat": min(first.get("repeat", 9.0), second.get("repeat", 9.0))
+                                  if second.get("repeat") is not None else first.get("repeat", 9.0)}
+                        verdict = judge(candidate, merged, meta_ok)
+                        if verdict == "reject" and cand_url not in reject_reasons:
+                            reject_reasons[cand_url] = reason or "reject"
             if verdict == "reject":
                 return "reject"
 
@@ -1906,7 +2053,9 @@ async def _search_once(
                     return rej(cand_url, "vision_multiple")   # fanned / stacked bars: several packs
                 if kinds.get("display", 0.0) >= DISPLAY_REJECT_PROB:
                     return rej(cand_url, "vision_display")   # counter display strip of many small packets, not one pack
-                if vis.get("match") is not None and vis["match"] < VISION_MIN_MATCH:
+                if vis.get("match") is not None and vis["match"] < VISION_MIN_MATCH                         and not listing_evidence(candidate, [fold(w) for w in first["words"]], meta_ok):
+                    # (a brand's generic bag on the store's own listing of this product scores low on
+                    #  "photo of <product>": the bag names no product, the listing does)
                     return rej(cand_url, "vision_match")   # looks like a different product altogether
             return verdict
 
@@ -1975,14 +2124,19 @@ async def _search_once(
 
         relaxed_tokens = [t for t in (re.sub(r'[^a-z0-9]', '', w) for w in re.split(r'[\s\-_,()/&.]+', product_name.lower()))
                           if len(t) >= 3 and t not in set(_brand_tokens(brand)) and t not in GENERIC_BRAND_WORDS
+                          and t not in FILLER_WORDS
                           and t not in PACKAGING_WORDS and t not in CORPORATE_WORDS and not re.match(r'^\d', t)]
         # category words name the kind of product, not which one
         category_tokens = [t for t in relaxed_tokens if t in CATEGORY_WORDS]
         relaxed_tokens = [t for t in relaxed_tokens if t not in CATEGORY_WORDS]
         product_word_share: Dict[int, float] = {}
 
-        async def _relaxed_ok(i: int) -> bool:
-            """A last-tier candidate must still be ONE front pack (vision) and not another brand."""
+        async def _relaxed_ok(i: int, loose: bool = False) -> bool:
+            """
+            A last-tier candidate must still be ONE front pack (vision) and not another brand.
+            loose=True (very last resort, so a row is never left empty): the brand may be named by the
+            listing instead of read on the pack, and one distinctive product word is enough.
+            """
             c = candidate_items[i]
             if c.img_src not in vision_map:
                 vision_map[c.img_src] = await read_vision(client, c.img_src, c.thumbnail_src, product_text)
@@ -1993,7 +2147,7 @@ async def _search_once(
             bad = [k for k in VISION_REJECT_KINDS if not (k == "multiple" and query_is_combo)]
             if any(kinds.get(k, 0.0) >= VISION_REJECT_PROB for k in bad) or kinds.get("display", 0.0) >= DISPLAY_REJECT_PROB:
                 return False
-            if kinds.get("front_single", 0.0) < RELAXED_MIN_FRONT or (vis.get("match") or 0.0) < RELAXED_MIN_MATCH:
+            if kinds.get("front_single", 0.0) < RELAXED_MIN_FRONT or                     (vis.get("match") or 0.0) < (LOOSE_MIN_MATCH if loose else RELAXED_MIN_MATCH):
                 return False
             if kinds.get("multiple", 0.0) >= RELAXED_MAX_MULTIPLE and not query_is_combo:
                 return False
@@ -2016,15 +2170,17 @@ async def _search_once(
             # ('saikrishnastore' is not Krishna Confectionery; a Perfetti listing shows Centerfruit for Alpenliebe)
             context = f"{fold(c.title)} {c.img_src} {c.url}"
             if not brand_evidence(words, brand):
-                return False
+                if not (loose and is_dynamic_brand_match(context, brand)):
+                    return False
             # ...and this product: a distinctive product word ('nariyal', 'halloween', 'cola'), not just the
             # category ('candy', 'toffee'). Krishna Rich Butter is not Krishna Nariyal Creamy Candy.
             compact = re.sub(r'[^a-z0-9]', '', f"{' '.join(words)} {context}".lower())
             needed = relaxed_tokens or category_tokens
             if needed:
-                hits = sum(1 for t in needed if t in compact)
-                # every distinctive word (short names), at least 2 of 3 for long names
-                if hits < (len(needed) if len(needed) <= 2 else math.ceil(len(needed) * 2 / 3)):
+                hits = sum(1 for t in needed if _word_hit(t, compact))
+                # every distinctive word ('Black Salt' needs 'salt', 'Honey Cinnamon' needs 'cinnamon');
+                # very long names: 3 of 4. Loose differs from relaxed only in where the brand is shown.
+                if hits < (len(needed) if len(needed) <= 3 else math.ceil(len(needed) * 3 / 4)):
                     return False
                 product_word_share[i] = hits / len(needed)
             return True
@@ -2055,6 +2211,12 @@ async def _search_once(
             good = [i for i, ok in zip(soft, oks) if ok]
             if good:
                 return max(good, key=_relaxed_score), "relaxed"
+            # Very last resort: this brand's front pack named by the listing, one product word matching
+            loose = sorted(idx_by_url[u] for u, w in reject_reasons.items() if w in LOOSE_REJECTS and u in idx_by_url)[:RELAXED_MAX]
+            oks = await asyncio.gather(*(_relaxed_ok(i, loose=True) for i in loose))
+            good = [i for i, ok in zip(loose, oks) if ok]
+            if good:
+                return max(good, key=_relaxed_score), "loose"
             return -1, ""
 
         # Step 2: Screening in rank order: the top image alone first, then OCR_BATCH in parallel.
@@ -2064,6 +2226,7 @@ async def _search_once(
         clean_shots: Dict[str, bool] = {}
         vision_map: Dict[str, Any] = {}
         working_src: Dict[str, str] = {}
+        second_looks = [0]
         selected_index = -1
         match = "exact"
         start = 0
@@ -2132,7 +2295,7 @@ async def _search_once(
         if big and await image_loads(client, big):
             chosen = chosen.model_copy(update={"img_src": big})
         vision_ok = vis is None or (vis.get("kinds", {}).get("front_single", 0) >= 0.5 and (vis.get("match") or 0) >= 0.3)
-        if match in ("nearest", "relaxed"):
+        if match in ("nearest", "relaxed", "loose"):
             confidence = "LOW"
         elif match == "exact" and clean and vision_ok:
             confidence = "HIGH"
