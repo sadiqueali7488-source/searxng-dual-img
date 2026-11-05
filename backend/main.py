@@ -279,6 +279,14 @@ async def download_results(job_id: str, format: str = Query("csv")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    """index.html is never cached, so an open tab picks up a new build on refresh (assets are hashed)."""
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 # Mount frontend production build if available
 frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
 if os.path.exists(frontend_dist):

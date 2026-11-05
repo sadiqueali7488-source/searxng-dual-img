@@ -51,6 +51,8 @@ class RowResult(BaseModel):
     # Where the image came from: "" (own search), "VARIANT_IMAGE" / "PRODUCT_IMAGE" (borrowed from the other search)
     product_source: str = ""
     variant_source: str = ""
+    # Message from the last Retry (e.g. no other verified image was found)
+    retry_note: str = ""
 
     # Backward compatibility helpers
     query: str = ""

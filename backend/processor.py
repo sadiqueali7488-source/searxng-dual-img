@@ -27,7 +27,25 @@ def parse_table(content: bytes, filename: str) -> pd.DataFrame:
             df = pd.read_csv(io.BytesIO(content), encoding="latin1", dtype=str)
     else:
         raise ValueError("Only .csv, .xlsx, and .xls files are supported.")
-    return df.fillna("")
+    df = df.fillna("")
+    # Text saved twice with the wrong encoding ("EldÃ¶re" -> "Eldöre"): repaired so search + OCR match
+    for col in df.columns:
+        mask = df[col].str.contains(_MOJIBAKE_MARK, regex=True, na=False)
+        if mask.any():
+            df.loc[mask, col] = df.loc[mask, col].map(fix_mojibake)
+    return df
+
+_MOJIBAKE_MARK = r"Ã.|Â.|â[-¿‘-›€]"
+
+def fix_mojibake(text: str) -> str:
+    """'EldÃ¶re' -> 'Eldöre'; text that isn't double-encoded is returned unchanged."""
+    for enc in ("cp1252", "latin1"):
+        try:
+            fixed = text.encode(enc).decode("utf-8")
+            return fixed if fixed != text else text
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
 
 PRODUCT_MASTER_30_COLUMNS = [
     'sku', 'variant_label', 'product_name', 'product_description',
@@ -176,13 +194,26 @@ def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v:
          on a mismatch a matching verified variant alternative is used, else the variant is flagged LOW
       2. variant not found -> the product image is used for the variant (variant_source=PRODUCT_IMAGE)
       3. product not found -> the variant image is used for the product (product_source=VARIANT_IMAGE)
+    Last-tier picks are flagged: variant_source=NEAREST_SIZE (closest size the company makes),
+    *_source=SIMILAR (vision-confirmed, OCR could not read the name). A SIMILAR pick never replaces a
+    verified image of the other search: the verified one is borrowed instead.
     """
+    tier_p = (res_p or {}).get("match") if (res_p or {}).get("status") == "SUCCESS" else None
+    tier_v = (res_v or {}).get("match") if (res_v or {}).get("status") == "SUCCESS" else None
+    # a SIMILAR variant is never better than the product's own image (same pack on both sides)
+    if tier_v == "relaxed" and tier_p:
+        res_v = {**res_v, "status": "NOT_FOUND", "best_image": None}     # -> variant borrows the verified product image
+        tier_v = None
+    if tier_p == "relaxed" and tier_v and tier_v != "relaxed":
+        res_p = {**res_p, "status": "NOT_FOUND", "best_image": None}     # -> product borrows the verified variant image
+        tier_p = None
     if res_p is not None:
         row.product_status = res_p["status"]
         row.product_source = ""
         if res_p["status"] == "SUCCESS" and res_p.get("best_image"):
             _set_image(row, "product", res_p["best_image"], res_p.get("alternatives", []))
             row.product_confidence = res_p.get("confidence") or "MEDIUM"
+            row.product_source = "SIMILAR" if tier_p == "relaxed" else ""
         else:
             row.product_image_url = row.product_thumbnail_url = ""
             row.product_confidence = ""
@@ -192,6 +223,7 @@ def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v:
         if res_v["status"] == "SUCCESS" and res_v.get("best_image"):
             _set_image(row, "variant", res_v["best_image"], res_v.get("alternatives", []))
             row.variant_confidence = res_v.get("confidence") or "MEDIUM"
+            row.variant_source = {"nearest": "NEAREST_SIZE", "relaxed": "SIMILAR"}.get(tier_v, "")
         else:
             row.variant_image_url = row.variant_thumbnail_url = ""
             row.variant_confidence = ""
@@ -211,6 +243,7 @@ def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v:
                 others = [a for a in row.variant_alternatives if a.img_src != best_alt.img_src]
                 _set_image(row, "variant", best_alt, others)
                 row.variant_confidence = "MEDIUM"
+                row.variant_source = ""
             elif row.product_confidence == "HIGH" and row.variant_confidence != "HIGH":
                 # The variant shows a different pack (e.g. Bansi Rava for Besan) and the product image is
                 # verified: a wrong product must never stay, so the verified product image is used instead
@@ -411,6 +444,17 @@ class SearchJob:
                 return row
         return None
 
+    def _recount_status(self, before: str, after: str):
+        """Keeps the job's found / not found / error counters right after a single row changes."""
+        names = {"SUCCESS": "success_count", "NOT_FOUND": "not_found_count", "ERROR": "error_count"}
+        if before == after:
+            return
+        if before in names:
+            setattr(self.status, names[before], max(0, getattr(self.status, names[before]) - 1))
+        if after in names:
+            setattr(self.status, names[after], getattr(self.status, names[after]) + 1)
+        self.persist_status()
+
     async def retry_row_search(
         self,
         row_index: int,
@@ -428,10 +472,12 @@ class SearchJob:
             orig = row.original_data or {}
             brand_val, prod_val, var_val = self.row_values(orig)
             res_p = res_v = None
+            before_status = row.status
 
             # 1. Search Product Image (Without Size)
             if target in ["both", "product"]:
                 p_query = custom_query if (target == "product" and custom_query) else row.product_query
+                old_p = (row.product_image_url, row.product_thumbnail_url)
                 row.product_status = "SEARCHING"
                 await self.broadcast("row_update", row.model_dump())
 
@@ -446,12 +492,15 @@ class SearchJob:
                     safesearch=safesearch,
                     time_range=time_range,
                     language=language,
-                    deep=True
+                    deep=True,
+                    fresh=True,
+                    exclude=list(old_p)
                 )
 
             # 2. Search Variant Image (With Size)
             if target in ["both", "variant"]:
                 v_query = custom_query if (target == "variant" and custom_query) else row.variant_query
+                old_v = (row.variant_image_url, row.variant_thumbnail_url)
                 row.variant_status = "SEARCHING"
                 await self.broadcast("row_update", row.model_dump())
 
@@ -466,11 +515,45 @@ class SearchJob:
                     safesearch=safesearch,
                     time_range=time_range,
                     language=language,
-                    deep=True
+                    deep=True,
+                    fresh=True,
+                    exclude=list(old_v)
                 )
 
+            # Retry looks for a different image than the current one
+            row.retry_note = ""
+            kept = []
+            prev = {}
+            if res_p is not None and res_p["status"] != "SUCCESS" and old_p[0]:
+                prev["product"] = (old_p, row.product_confidence, row.product_source)
+                kept.append("product")
+            if res_v is not None and res_v["status"] != "SUCCESS" and old_v[0]:
+                prev["variant"] = (old_v, row.variant_confidence, row.variant_source)
+                kept.append("variant")
             apply_search_results(row, res_p, res_v)
+            # The other image is borrowed when one is still missing (variant <- product image); the old image
+            # comes back only when nothing at all was found, so the row is never wiped by a retry
+            notes = []
+            for side in kept:
+                other = "variant" if side == "product" else "product"
+                if getattr(row, f"{side}_image_url"):
+                    notes.append(f"No other verified {side} image found; using the {other} image")
+                    continue
+                (url, thumb), conf, src = prev[side]
+                setattr(row, f"{side}_image_url", url)
+                setattr(row, f"{side}_thumbnail_url", thumb)
+                setattr(row, f"{side}_confidence", conf)
+                setattr(row, f"{side}_source", src)
+                setattr(row, f"{side}_status", "SUCCESS")
+                notes.append(f"No other verified {side} image found; kept the current one")
+            row.retry_note = "; ".join(notes)
+            if row.product_image_url and row.variant_image_url:
+                row.status, row.error_message = "SUCCESS", None
+            row.image_url = row.product_image_url or row.variant_image_url
+            row.thumbnail_url = row.product_thumbnail_url or row.variant_thumbnail_url
+            self._recount_status(before_status, row.status)
             await self.broadcast("row_update", row.model_dump())
+            await self.broadcast("status_update", self.status.model_dump())
             self.persist_row(row)
             return row
         return None

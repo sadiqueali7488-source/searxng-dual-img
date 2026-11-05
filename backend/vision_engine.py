@@ -49,6 +49,11 @@ SCENE_PROMPTS = {
     "crop": [
         "an extreme close-up crop showing only part of a package",
     ],
+    # Shop-counter display strips / hanger cards with many small sachets (e.g. a lollipop strip):
+    # CLIP calls them "one front pack" otherwise. Rejected only when very sure (real bags of candy score <= 0.56)
+    "display": [
+        "a cardboard display strip with many identical small packets hanging in a column",
+    ],
 }
 
 _executor = ThreadPoolExecutor(max_workers=VISION_WORKERS, thread_name_prefix="vision")
