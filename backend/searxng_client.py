@@ -77,6 +77,8 @@ def is_clean_packshot(img_url: str, quality: float) -> bool:
 # Below this border score an image is a lifestyle scene, a banner or a half-cut close-up: never used
 # (measured: cropped close-up 0.05, ad banner 0.00, kitchen-table photo 0.11; packshots 0.45-1.0)
 MIN_PACKSHOT_QUALITY = 0.25
+MIN_IMAGE_SIDE = 250
+MIN_FRONT_SINGLE = 0.25       # vision: below this it is an ad, banner or recipe scene, not one front pack          # real pixels: a 220x220 thumbnail is too small and blurry for a product image
 # ocr_engine.repeated_pack_score at or below this = the same pack photographed 2-3 times side by side
 # (measured: identical 2-pack 0.07, single packs 0.39-0.80)
 REPEATED_PACK_MAX = 0.2
@@ -102,7 +104,7 @@ def is_banner_or_composite(words: List[str], brand: str = "") -> bool:
 
 # Part of every search-cache key: bump it whenever the selection rules change, so results chosen
 # under older (weaker) rules are never served from the cache again
-SEARCH_RULES_VERSION = "rules-12"
+SEARCH_RULES_VERSION = "rules-18"
 # Part of every OCR-cache key: bump when ocr_engine returns new fields
 OCR_CACHE_VERSION = "v3"
 
@@ -223,7 +225,7 @@ async def read_image(client: httpx.AsyncClient, img_url: str, fallback_url: str 
         result = await run_ocr_full(content, stage)
     except Exception:
         return empty
-    result = {**result, "src": working}
+    result = {**result, "src": working, "side": image_min_side(img_url)}
     cache_store.put_ocr(key, result)
     return result
 
@@ -280,7 +282,9 @@ TRUSTED_IMAGE_HOSTS = ["bbassets.com", "bigbasket.com", "media-amazon.com", "gro
                        "rukminim", "flixcart.com", "swiggy.com", "dmart.in"]
 
 def trusted_query(plain_q: str) -> str:
-    return f"{plain_q} " + " OR ".join(f"site:{s}" for s in TRUSTED_STORE_SITES)
+    # Bing (the engine that answers) ignores "site:" and returns unrelated photos for it;
+    # shopping words pull the store listings (BigBasket, Amazon, JioMart...) to the top instead
+    return f"{plain_q} buy online"
 
 def _brand_tokens(brand: str) -> List[str]:
     # "Cote D'or" -> ['cote', 'dor'] (punctuation inside a word is dropped, as OCR drops it)
@@ -375,6 +379,16 @@ def size_distance(words: List[str], title: str, variant_label: str) -> Optional[
                 best = dist if best is None else min(best, dist)
     return best
 
+def image_min_side(url: str) -> int:
+    """Shorter side in real pixels of a downloaded image (0 = unknown)."""
+    data = _IMAGE_BYTES.get(url)
+    if not data:
+        return 0
+    try:
+        return min(Image.open(io.BytesIO(data)).size)
+    except Exception:
+        return 0
+
 def resolution_px(resolution: str) -> int:
     """'1000 x 1000' -> 1000 (shorter side); 0 when unknown."""
     m = re.search(r'(\d{2,5})\s*[x×]\s*(\d{2,5})', resolution or "")
@@ -384,26 +398,43 @@ def brand_on_pack(words: List[str], brand: str) -> bool:
     """The brand is printed on the pack (strongly, or at least its main word)."""
     return bool(brand_evidence(words, brand))
 
+def product_token_hits(words: List[str], brand: str, product_name: str) -> Tuple[int, int]:
+    """
+    (printed, needed): how many distinctive product-name words are PRINTED on the pack.
+    Distinctive = not the brand, not generic ('super', 'gold'), not the category ('rice', 'candy').
+    A local / English name of the same thing counts ('toor' pack may say 'tur' / 'arhar').
+    """
+    compact = re.sub(r'[^a-z0-9]', '', fold(" ".join(words or [])).lower())
+    brand_toks = set(_brand_tokens(brand))
+    tokens = []
+    for t in re.split(r'[\s\-_,()/&.]+', fold(product_name).lower()):
+        t = re.sub(r'[^a-z0-9]', '', t)
+        if len(t) >= 4 and t not in brand_toks and t not in GENERIC_BRAND_WORDS and t not in CATEGORY_WORDS \
+                and t not in PACKAGING_WORDS and not re.match(r'^\d', t) and t not in tokens:
+            tokens.append(t)
+    hits = 0
+    for t in tokens:
+        aliases = {t}
+        for group in GRAIN_ALIAS_GROUPS:
+            if t in [re.sub(r'[^a-z0-9]', '', a) for a in group]:
+                aliases.update(re.sub(r'[^a-z0-9]', '', a) for a in group)
+        if any(a in compact for a in aliases):
+            hits += 1
+    return hits, len(tokens)
+
 def product_on_pack(words: List[str], brand: str, product_name: str) -> bool:
     """
-    At least one distinctive product word is PRINTED on the pack (not only in the shop's title).
-    Shops mislabel listings: a "Aashirvaad Besan" listing showing a pack that reads "Bansi Rava" is wrong.
+    The product's own name is PRINTED on the pack (not only in the shop's title): every distinctive
+    word for short names, at least 2 of 3 for long ones. Shops mislabel listings: a "Parry's Bullet Kolam"
+    listing showing "Parry's Kolam Steam Rice", or "Aashirvaad Besan" showing "Bansi Rava", is wrong.
     Names with no distinctive word (e.g. "Saffola Gold Oil") pass.
     """
     if not words or not product_name:
         return True
-    compact = re.sub(r'[^a-z0-9]', '', " ".join(words).lower())
-    brand_toks = set(_brand_tokens(brand))
-    tokens = [t for t in re.split(r'[\s\-_,()/&]+', product_name.lower())
-              if len(t) >= 4 and t not in brand_toks and t not in GENERIC_BRAND_WORDS and not re.match(r'^\d', t)]
-    if not tokens:
+    hits, needed = product_token_hits(words, brand, product_name)
+    if needed == 0:
         return True
-    # local / English names of the same grain count ("khapli" pack may say "emmer")
-    expanded = set(tokens)
-    for group in GRAIN_ALIAS_GROUPS:
-        if any(t in group for t in tokens):
-            expanded.update(re.sub(r'[^a-z0-9]', '', a) for a in group)
-    return any(t in compact for t in expanded)
+    return hits >= (needed if needed <= 3 else math.ceil(needed * 2 / 3))
 
 def ocr_repeats_multipack(words: List[str], brand: str = "") -> bool:
     """
@@ -439,14 +470,43 @@ VARIANT_MODIFIERS = [
     'double toned', 'toned', 'skimmed', 'full cream',
     'millet', 'millets', 'multigrain', 'multigrains', 'multi grain', 'multi grains',
     'tea bags', 'tea bag', 'premix', 'green tea',
+    'gulbarga', 'lachkari', 'surti', 'hmt', 'wada', 'jsr', 'rnr', 'bpt', 'sona masoori', 'ponni',
+    'mogra', 'dubar', 'tibar', 'rozana', 'supreme',
 ]
+EDITION_MARKERS = ['heartblush', 'youaremy', 'aremylove', 'valentine', 'limitededition', 'rakhi', 'diwali',
+                   'christmas', 'xmas', 'halloween', 'holiedition', 'festiveedition', 'specialedition', 'giftpack']
 # Checked in the title only: packs often print these as claims ("rich in protein")
 TITLE_ONLY_MODIFIERS = ['high fibre', 'high fiber', 'protein', 'high protein', 'kids', 'baby', 'junior', 'mini', 'jumbo', 'refill', 'travel', 'sample']
+
+# How the grain was processed makes a different product: Steam Rice Kolam is not Raw Rice Kolam
+RICE_PROCESS = {"raw": "raw", "steam": "steam", "steamed": "steam", "boiled": "boiled",
+                "parboiled": "boiled", "sella": "boiled"}
+RICE_WORDS = ("rice", "kolam", "basmati", "sona masoori", "sonamasoori", "ponni", "idli")
+
+def rice_processes(text: str) -> set:
+    t = (text or "").lower()
+    return {v for k, v in RICE_PROCESS.items() if re.search(rf'(?<![a-z0-9]){k}(?![a-z0-9])', t)}
+
+def has_process_conflict(name: str, cand_text: str) -> bool:
+    """Rice only. A name without a process word (plain 'Kolam Rice') accepts raw, not steam / boiled."""
+    if not any(w in name for w in RICE_WORDS):
+        return False
+    want, got = rice_processes(name), rice_processes(cand_text)
+    extra = got - want
+    return bool(extra) if want else bool(extra - {"raw"})
 
 def has_variant_conflict(title: str, words: List[str], product_name: str, brand: str = "") -> bool:
     name = f"{product_name} {brand}".lower()
     t = (title or "").lower()
     ocr = " ".join(words or []).lower()
+    if has_process_conflict(name, f"{t} {ocr}"):
+        return True
+    # Special / seasonal editions are other products unless the Excel name says so
+    # (OCR runs script words together: 'heartblush', 'aremy' = "you are my love")
+    name_c = re.sub(r'[^a-z0-9]', '', name)
+    cand_c = re.sub(r'[^a-z0-9]', '', f"{t} {ocr}")
+    if any(m in cand_c and m not in name_c for m in EDITION_MARKERS):
+        return True
     for m in VARIANT_MODIFIERS:
         pat = rf'(?<![a-z0-9]){re.escape(m)}(?![a-z0-9])'
         # singular / plural of a word in the name is the same variant ("Multigrain" vs "Multigrains")
@@ -520,6 +580,10 @@ GRAIN_ALIAS_GROUPS = [
     ['rajgira', 'amaranth'], ['makka', 'makki', 'maize'], ['jau', 'barley'], ['samak', 'sama'],
     ['chawal', 'rice flour'], ['soya', 'soyabean'], ['multigrain', 'multi grain'], ['7 grain', '7grain'],
     ['ragi', 'nachni', 'finger millet'], ['jowar', 'sorghum'], ['bajra', 'pearl millet'],
+    ['toor', 'tur', 'tuvar', 'toovar', 'arhar'], ['chana', 'chickpea', 'bengal gram'], ['moong', 'mung', 'green gram'],
+    ['urad', 'black gram'], ['masoor', 'red lentil', 'lentil'], ['rajma', 'kidney bean', 'kidney beans'],
+    ['kabuli', 'chickpeas'], ['sooji', 'suji', 'rava', 'semolina'], ['besan', 'gram flour'],
+    ['steam', 'steamed'], ['parboiled', 'boiled'],
 ]
 
 def has_specialty_flour_conflict(target_prod: str, cand_text: str) -> bool:
@@ -1312,7 +1376,8 @@ async def search_searxng_image(
     """
     clean_q = sanitize_search_query(query)
     # The product image (without size) is the same for every size of a product: leave size out of its key
-    size_key = variant_label if (is_variant or is_query_multipack(product_name, variant_label)) else ""
+    # The product image may not show ANOTHER size than the row's, so the size is part of both keys
+    size_key = variant_label
     key = hashlib.sha1(json.dumps(
         [SEARCH_RULES_VERSION, base_url.rstrip("/"), clean_q, brand, product_name, size_key, is_variant, safesearch, time_range, language, top_limit]
     ).encode()).hexdigest()
@@ -1424,8 +1489,8 @@ async def _search_uncached(
     all_reasons: Dict[str, str] = {}
     tried = 0
     for n, (queries, page) in enumerate(attempts + extra):
-        if n >= len(attempts) and fallback_result is not None:
-            break   # the extra attempts are only for rows with nothing verified
+        if n >= len(attempts) and fallback_result is not None and not (is_variant and variant_label):
+            break   # extra attempts: rows with nothing verified, or a variant without its exact size yet
         tried += 1
         res = await _search_once(client, base_url, queries, page, brand, product_name, variant_label,
                                  is_variant, safesearch, time_range, language, top_limit, seen, excluded)
@@ -1696,6 +1761,20 @@ async def _search_once(
             reject_reasons.setdefault(url, why)
             return "reject"
 
+        def vision_says_single(url: str) -> bool:
+            """Vision is sure it is one pack (a bag's repeating print pattern is not several packs)."""
+            k = (vision_map.get(url) or {}).get("kinds", {})
+            return k.get("front_single", 0.0) >= 0.8 and k.get("multiple", 1.0) < 0.1
+
+        def listing_evidence(candidate: ImageResult, words: List[str], meta_ok: bool) -> bool:
+            """A generic brand bag (prints no product name at all) on the store's listing of this product.
+            A bag that prints SOME other name ('Kolam Steam Rice' for 'Bullet Kolam') is another product."""
+            if not (meta_ok and words and is_trusted(candidate) and brand_evidence(words, brand)):
+                return False
+            if contains_conflicting_brand(" ".join(words), brand):
+                return False
+            return product_token_hits(words, brand, product_name)[0] == 0
+
         def judge(candidate: ImageResult, read: Dict[str, Any], meta_ok: bool) -> str:
             """Applies every rule to one OCR read: 'exact', 'fallback' or 'reject'."""
             words = [fold(w) for w in read["words"]]
@@ -1708,12 +1787,19 @@ async def _search_once(
             # and must show the brand or product name printed on it
             if is_back_panel_or_nutrition(title, cand_url, words):
                 return rej(cand_url, "back_panel")
-            if not ocr_shows_front(words, brand, product_name):
+            # The store's own listing of THIS product (BigBasket / Amazon ... page named after it) whose
+            # photo shows this brand: stores often use one generic bag per brand ("bb Royal ... Net Qty 10 kg")
+            listing = listing_evidence(candidate, words, meta_ok)
+            if not ocr_shows_front(words, brand, product_name) and not listing:
                 return rej(cand_url, "not_front")
 
             # PROPER PHOTO: no lifestyle scenes, half-cut close-ups, ad banners or "pouch OR bottle" composites
             if quality < MIN_PACKSHOT_QUALITY and not any(h in _host(cand_url) for h in CLEAN_PACKSHOT_HOSTS):
                 return rej(cand_url, "low_quality")
+            nums = [int(n) for n in re.findall(r'\d+', candidate.resolution or "")[:2]]
+            side = read.get("side") or image_min_side(cand_url) or (min(nums) if len(nums) == 2 else 0)
+            if 0 < side < MIN_IMAGE_SIDE:
+                return rej(cand_url, "low_quality")   # tiny thumbnail
             if is_banner_or_composite(words, brand):
                 return rej(cand_url, "banner")
 
@@ -1721,21 +1807,23 @@ async def _search_once(
             if not query_is_combo and (
                 is_candidate_multipack(title, cand_context, words, resolution=candidate.resolution)
                 or ocr_repeats_multipack(words, brand)
-                or read.get("repeat", 9.0) <= REPEATED_PACK_MAX
+                or (read.get("repeat", 9.0) <= REPEATED_PACK_MAX and not vision_says_single(cand_url))
             ):
                 return rej(cand_url, "multipack")
 
             # Right brand, right product, no extra variant (Organic / Select / Lite ...)
             if not is_dynamic_brand_match(cand_context, brand, words):
                 return rej(cand_url, "brand")
-            if not verify_product_keyword_match(words, title, product_name, brand, cand_context):
+            name_ok = verify_product_keyword_match(words, title, product_name, brand, cand_context)
+            if not name_ok and not listing:
                 return rej(cand_url, "product_words")
             if has_variant_conflict(title, words, product_name, brand):
                 return rej(cand_url, "variant_conflict")
             if shows_other_family(product_name, title, words):
                 return rej(cand_url, "other_family")
             # Mislabelled listings: the product's own name must be printed on the pack
-            if brand_on_pack(words, brand) and not product_on_pack(words, brand, product_name):
+            listing_only = not name_ok or (brand_on_pack(words, brand) and not product_on_pack(words, brand, product_name))
+            if listing_only and not listing:
                 return rej(cand_url, "product_not_on_pack")
 
             clean = is_clean_packshot(cand_url, quality)
@@ -1743,9 +1831,21 @@ async def _search_once(
                 # WITH SIZE: Must contain exact variant size on pack / title / url
                 if _ocr_shows_other_size(words, variant_label):
                     return rej(cand_url, "other_size")
+                if listing_only:
+                    # Generic bag: only the store page names the product, so the bag itself must print
+                    # this exact size AND the page must be the listing of this size
+                    on_bag = bool(_parse_sizes(" ".join(words)) & _parse_sizes(variant_label))
+                    if on_bag and verify_size_strict([], title, variant_label, cand_context):
+                        return "exact"
+                    return rej(cand_url, "listing_no_size")
                 if meta_ok and clean and verify_size_strict(words, title, variant_label, cand_context):
                     return "exact"
                 return "fallback"
+            # WITHOUT SIZE: a pack (or caption) printing another size ("Moong Dhall 100 g" for the 1 kg row) is wrong
+            if variant_label and _ocr_shows_other_size(words, variant_label):
+                return rej(cand_url, "product_other_size")
+            if listing_only:
+                return "fallback"   # a pack with the product name printed on it is preferred
             # WITHOUT SIZE: prefer a clean pack without a size callout (1kg, 500g, etc.)
             if meta_ok and clean and not has_any_size_callout(words, title, cand_url):
                 return "exact"
@@ -1784,12 +1884,15 @@ async def _search_once(
             first = await read_image(client, cand_url, candidate.thumbnail_src, "fast")
             clean_shots[cand_url] = is_clean_packshot(cand_url, first["quality"])
             working_src[cand_url] = first.get("src") or ""
+            if first.get("repeat", 9.0) <= REPEATED_PACK_MAX and first["words"]:
+                # repeated texture: one bag with a pattern, or several packs? vision decides
+                vision_map[cand_url] = await read_vision(client, cand_url, candidate.thumbnail_src, product_text)
             verdict = judge(candidate, first, meta_ok)
             if verdict == "reject":
                 return "reject"
 
             # Vision (OpenCLIP): what kind of photo is it, and is it this product at all?
-            vis = await read_vision(client, cand_url, candidate.thumbnail_src, product_text)
+            vis = vision_map.get(cand_url) or await read_vision(client, cand_url, candidate.thumbnail_src, product_text)
             vision_map[cand_url] = vis
             if vis:
                 kinds = vis.get("kinds", {})
@@ -1797,6 +1900,10 @@ async def _search_once(
                 worst = max(bad_kinds, key=lambda k: kinds.get(k, 0.0))
                 if kinds.get(worst, 0.0) >= VISION_REJECT_PROB and kinds.get(worst, 0.0) > kinds.get("front_single", 0.0):
                     return rej(cand_url, "vision_kind")
+                if kinds and kinds.get("front_single", 0.0) < MIN_FRONT_SINGLE:
+                    return rej(cand_url, "vision_not_front")   # ad / banner / recipe scene, not a packshot
+                if not query_is_combo and kinds.get("multiple", 0.0) >= RELAXED_MAX_MULTIPLE:
+                    return rej(cand_url, "vision_multiple")   # fanned / stacked bars: several packs
                 if kinds.get("display", 0.0) >= DISPLAY_REJECT_PROB:
                     return rej(cand_url, "vision_display")   # counter display strip of many small packets, not one pack
                 if vis.get("match") is not None and vis["match"] < VISION_MIN_MATCH:
@@ -1901,6 +2008,10 @@ async def _search_once(
                 return False
             if shows_other_family(product_name, fold(c.title), words):
                 return False
+            if not is_variant and variant_label and _ocr_shows_other_size(words, variant_label):
+                return False   # product image never shows another size
+            if has_variant_conflict(f"{fold(c.title)} {c.img_src} {c.url}", words, product_name, brand):
+                return False   # Raw Rice Kolam is not Steam Rice Kolam
             # It must be THIS brand PRINTED ON THE PACK: shop names and listing titles lie
             # ('saikrishnastore' is not Krishna Confectionery; a Perfetti listing shows Centerfruit for Alpenliebe)
             context = f"{fold(c.title)} {c.img_src} {c.url}"
@@ -1912,7 +2023,8 @@ async def _search_once(
             needed = relaxed_tokens or category_tokens
             if needed:
                 hits = sum(1 for t in needed if t in compact)
-                if hits == 0:
+                # every distinctive word (short names), at least 2 of 3 for long names
+                if hits < (len(needed) if len(needed) <= 2 else math.ceil(len(needed) * 2 / 3)):
                     return False
                 product_word_share[i] = hits / len(needed)
             return True
@@ -1983,6 +2095,12 @@ async def _search_once(
             (i for i in range(len(candidate_items)) if i != selected_index and verdicts.get(i) != "reject"),
             key=lambda i: (rank.get(verdicts.get(i, ""), 2), -score(i) if i in verdicts else i)
         )
+        # Never offer a dead link: unscreened candidates (e.g. a BigBasket _1 guessed from a _2 photo) are checked
+        alt_pool = alt_order[:MAX_ALTERNATIVES * 2]
+        unchecked = [i for i in alt_pool if not working_src.get(candidate_items[i].img_src)]
+        loads = await asyncio.gather(*(image_loads(client, candidate_items[i].img_src, 4.0) for i in unchecked))
+        dead = {i for i, ok in zip(unchecked, loads) if not ok}
+        alt_order = [i for i in alt_pool if i not in dead]
         alternatives = [candidate_items[i] for i in alt_order][:MAX_ALTERNATIVES]
         alt_embeddings = {
             candidate_items[i].img_src: (vision_map.get(candidate_items[i].img_src) or {}).get("embedding")

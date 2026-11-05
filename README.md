@@ -57,7 +57,7 @@ Open **`http://localhost:8000`**. The first start downloads the PP-OCRv6 and Ope
 2. Every candidate is downloaded (dead links are never used) and checked by **PP-OCRv6** (brand, product, exact size, back panel, multi-pack text) and **OpenCLIP** (single front pack vs back / several packs / banner / crop, and whether it looks like this product).
 3. The best candidate (rules + vision + same official photo on several stores + trusted store) must also pass a **second, stricter OCR**.
 4. Product and variant images must show the same pack; if the variant (with size) isn't found, the product image is used and flagged.
-5. Export adds `product_image_confidence` / `variant_image_confidence` (HIGH / MEDIUM / LOW) and `*_image_source` (EXACT / PRODUCT_IMAGE / VARIANT_IMAGE). Check the LOW rows.
+5. The app shows each image's confidence (HIGH / MEDIUM / LOW) and source (own search, borrowed, nearest size, similar) as badges; check the LOW rows there. The downloaded file keeps your original columns with the image links filled in.
 
 ---
 

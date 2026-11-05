@@ -905,12 +905,7 @@ class JobManager:
             # DIRECT CLEAN LINKS WITHOUT ARRAY BRACKETS
             row_dict["product_images"] = prod_link
             row_dict["variant_images"] = var_link
-            # HIGH / MEDIUM / LOW: filter LOW rows in Excel for a quick manual check
-            row_dict["product_image_confidence"] = row_res.product_confidence if prod_link else "NOT_FOUND"
-            row_dict["variant_image_confidence"] = row_res.variant_confidence if var_link else "NOT_FOUND"
-            # EXACT = own search; PRODUCT_IMAGE / VARIANT_IMAGE = borrowed from the other search
-            row_dict["product_image_source"] = (row_res.product_source or "EXACT") if prod_link else ""
-            row_dict["variant_image_source"] = (row_res.variant_source or "EXACT") if var_link else ""
+            # Confidence / source stay in the app (badges), not in the downloaded file
 
             if not job.is_product_master:
                 row_dict["product_image_url"] = prod_link
