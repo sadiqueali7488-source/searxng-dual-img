@@ -10,6 +10,14 @@ import {
   ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 } from 'lucide-react';
 
+// Where an image came from when it is not this search's own verified pick
+const SOURCE_LABEL = {
+  VARIANT_IMAGE: ' (from variant)',
+  PRODUCT_IMAGE: ' (from product)',
+  NEAREST_SIZE: ' (nearest size)',
+  SIMILAR: ' (similar, check)',
+};
+
 // Memoized individual TableRow component for maximum 60fps performance
 const TableRow = React.memo(function TableRow({
   row,
@@ -121,6 +129,16 @@ const TableRow = React.memo(function TableRow({
         <div className="text-[10px] text-cyan-400 font-mono mt-0.5 truncate max-w-[240px]">
           🔸 With size: {row.variant_query}
         </div>
+        {(row.product_confidence || row.variant_confidence) && (
+          <div className="text-[10px] font-mono mt-1 flex gap-2">
+            <span className={row.product_confidence === 'HIGH' ? 'text-emerald-400' : row.product_confidence === 'LOW' ? 'text-rose-400' : 'text-amber-400'}>
+              P: {row.product_confidence || '—'}{SOURCE_LABEL[row.product_source] || ''}
+            </span>
+            <span className={row.variant_confidence === 'HIGH' ? 'text-emerald-400' : row.variant_confidence === 'LOW' ? 'text-rose-400' : 'text-amber-400'}>
+              V: {row.variant_confidence || '—'}{SOURCE_LABEL[row.variant_source] || ''}
+            </span>
+          </div>
+        )}
       </td>
 
       {/* Status */}
@@ -263,6 +281,7 @@ export default function App() {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
       setUploadData(res.data);
+      rememberJob(res.data.job_id);
       const cols = res.data.columns;
       const likelyCol = cols.find(c =>
         /^(product_name|product|name|item|title|p_name)$/i.test(c)
@@ -334,6 +353,91 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     });
   }, []);
 
+  // Live updates for a job (also used to re-attach after a page refresh)
+  const connectStream = useCallback((jobId) => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const es = new EventSource(`/api/stream-progress/${jobId}`);
+    eventSourceRef.current = es;
+
+    es.addEventListener('initial_rows', (e) => {
+      const initialRows = JSON.parse(e.data);
+      setRows(initialRows);
+    });
+
+    es.addEventListener('status_update', (e) => {
+      const status = JSON.parse(e.data);
+      setJobStatus(status);
+      if (status.state === 'paused') setIsPaused(true);
+      if (status.state === 'running') setIsPaused(false);
+      if (status.state === 'completed' || status.state === 'cancelled') {
+        setIsProcessing(false);
+        setIsRetryingNotFound(false);
+      }
+    });
+
+    es.addEventListener('row_update', (e) => {
+      const updatedRow = JSON.parse(e.data);
+      updateBufferRef.current.set(updatedRow.row_index, updatedRow);
+
+      if (!batchTimerRef.current) {
+        batchTimerRef.current = setTimeout(() => {
+          batchTimerRef.current = null;
+          flushRowBatch();
+        }, 250);
+      }
+    });
+
+    es.addEventListener('job_done', () => {
+      flushRowBatch();
+      setIsProcessing(false);
+      setIsRetryingNotFound(false);
+      es.close();
+    });
+
+    es.onerror = () => {};
+  }, [flushRowBatch]);
+
+  // Each tab remembers its own job in the URL (#job=...), so a refresh shows the same job again
+  const rememberJob = (jobId) => {
+    try {
+      window.history.replaceState(null, '', `#job=${jobId}`);
+      localStorage.setItem('lastJobId', jobId);
+    } catch (e) { /* storage unavailable: nothing to remember */ }
+  };
+
+  useEffect(() => {
+    let jobId = (window.location.hash.match(/job=([\w-]+)/) || [])[1];
+    if (!jobId) {
+      try { jobId = localStorage.getItem('lastJobId'); } catch (e) { jobId = null; }
+    }
+    if (!jobId) return;
+    axios.get(`/api/job/${jobId}`).then((res) => {
+      const { status, columns, rows: savedRows } = res.data;
+      setUploadData({
+        job_id: jobId,
+        filename: status.filename,
+        total_rows: status.total_rows,
+        columns,
+        preview: savedRows.slice(0, 10).map(r => r.original_data),
+      });
+      const likelyCol = columns.find(c => /^(product_name|product|name|item|title|p_name)$/i.test(c))
+        || columns.find(c => /product|name|item|title/i.test(c)) || columns[0];
+      setQueryColumn(likelyCol || '');
+      setRows(savedRows);
+      setJobStatus(status);
+      rememberJob(jobId);
+      const live = status.state === 'running' || status.state === 'paused';
+      setIsProcessing(live);
+      setIsPaused(status.state === 'paused');
+      if (live) connectStream(jobId);
+    }).catch(() => {
+      try { localStorage.removeItem('lastJobId'); } catch (e) { /* ignore */ }
+    });
+  }, [connectStream]);
+
   const handleStartSearch = async () => {
     if (!uploadData?.job_id || !queryColumn) return;
 
@@ -356,49 +460,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
 
       await axios.post(`/api/start-search/${uploadData.job_id}`, config);
 
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
-
-      const es = new EventSource(`/api/stream-progress/${uploadData.job_id}`);
-      eventSourceRef.current = es;
-
-      es.addEventListener('initial_rows', (e) => {
-        const initialRows = JSON.parse(e.data);
-        setRows(initialRows);
-      });
-
-      es.addEventListener('status_update', (e) => {
-        const status = JSON.parse(e.data);
-        setJobStatus(status);
-        if (status.state === 'paused') setIsPaused(true);
-        if (status.state === 'running') setIsPaused(false);
-        if (status.state === 'completed' || status.state === 'cancelled') {
-          setIsProcessing(false);
-          setIsRetryingNotFound(false);
-        }
-      });
-
-      es.addEventListener('row_update', (e) => {
-        const updatedRow = JSON.parse(e.data);
-        updateBufferRef.current.set(updatedRow.row_index, updatedRow);
-
-        if (!batchTimerRef.current) {
-          batchTimerRef.current = setTimeout(() => {
-            batchTimerRef.current = null;
-            flushRowBatch();
-          }, 250);
-        }
-      });
-
-      es.addEventListener('job_done', () => {
-        flushRowBatch();
-        setIsProcessing(false);
-        setIsRetryingNotFound(false);
-        es.close();
-      });
-
-      es.onerror = () => {};
+      connectStream(uploadData.job_id);
 
     } catch (err) {
       alert('Failed to start search: ' + (err.response?.data?.detail || err.message));
@@ -417,6 +479,8 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
         alert(res.data.message);
         setIsRetryingNotFound(false);
         setIsProcessing(false);
+      } else {
+        connectStream(uploadData.job_id);
       }
     } catch (err) {
       alert('Retry failed: ' + (err.response?.data?.detail || err.message));
@@ -443,6 +507,36 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
     } catch (err) {
       console.error(err);
     }
+  };
+
+  // Clears the screen for a new file; a running job is cancelled first (after confirmation)
+  const handleReset = async () => {
+    const live = jobStatus && (jobStatus.state === 'running' || jobStatus.state === 'paused');
+    if (live && !window.confirm('A search is still running. Stop it and start fresh?')) return;
+    if (!live && rows.length > 0 && !window.confirm('Clear this job from the screen and start a new upload? (Download your results first.)')) return;
+    if (live && uploadData?.job_id) {
+      try { await axios.post(`/api/job/${uploadData.job_id}/cancel`); } catch (e) { /* already stopped */ }
+    }
+    if (eventSourceRef.current) eventSourceRef.current.close();
+    if (batchTimerRef.current) { clearTimeout(batchTimerRef.current); batchTimerRef.current = null; }
+    updateBufferRef.current.clear();
+    try {
+      window.history.replaceState(null, '', window.location.pathname);
+      localStorage.removeItem('lastJobId');
+    } catch (e) { /* storage unavailable */ }
+    setFile(null);
+    setUploadData(null);
+    setRows([]);
+    setJobStatus(null);
+    setIsProcessing(false);
+    setIsPaused(false);
+    setIsRetryingNotFound(false);
+    setDetailModalRow(null);
+    setQueryColumn('');
+    setAdditionalColumns([]);
+    setFilterStatus('ALL');
+    setTableSearch('');
+    setCurrentPage(1);
   };
 
   const handleCancel = async () => {
@@ -642,7 +736,7 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
       });
       setDetailModalRow(prev => prev?.row_index === rowIndex ? res.data.row : prev);
     } catch (err) {
-      alert('Retry failed: ' + err.message);
+      alert('Retry failed: ' + (err.response?.data?.detail || err.message));
     } finally {
       setRetryingTarget(null);
     }
@@ -751,6 +845,16 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
 
         {/* Right Nav controls */}
         <div className="flex items-center space-x-3">
+          {(uploadData || rows.length > 0) && (
+            <button
+              onClick={handleReset}
+              className="flex items-center space-x-1.5 bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/40 rounded-lg px-3 py-1.5 text-xs font-bold transition cursor-pointer"
+              title="Clear this job and start a new upload"
+            >
+              <RotateCw className="w-3.5 h-3.5" />
+              <span>Reset</span>
+            </button>
+          )}
           <div className="flex items-center space-x-2 bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs">
             <span
               className={`w-2 h-2 rounded-full ${
@@ -1373,14 +1477,31 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                   </div>
                 </div>
 
-                <button
-                  onClick={() => setDetailModalRow(null)}
-                  className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer shrink-0"
-                  title="Close modal"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={() => handleRetrySingle(detailModalRow.row_index, null, 'both')}
+                    disabled={!!retryingTarget}
+                    className="bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-wait text-slate-950 font-bold text-xs px-3.5 py-2 rounded-xl transition cursor-pointer flex items-center space-x-1.5 shadow-md active:scale-95"
+                    title="Search both images again (fresh search, skips the current images)"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${retryingTarget === 'both' ? 'animate-spin' : ''}`} />
+                    <span>{retryingTarget === 'both' ? 'Searching...' : 'Retry Both'}</span>
+                  </button>
+                  <button
+                    onClick={() => setDetailModalRow(null)}
+                    className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                    title="Close modal"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
+              {detailModalRow.retry_note && !retryingTarget && (
+                <div className="mx-6 mt-3 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 flex items-center gap-2">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{detailModalRow.retry_note}</span>
+                </div>
+              )}
 
               {/* Modal Body */}
               <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-6">
@@ -1399,7 +1520,9 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                           </h4>
                         </div>
                         <span className="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 px-2.5 py-0.5 rounded-full font-mono font-bold">
-                          Clean Packshot
+                          {detailModalRow.product_image_url
+                            ? `${detailModalRow.product_confidence || 'MEDIUM'}${SOURCE_LABEL[detailModalRow.product_source] || ''}`
+                            : 'Not found'}
                         </span>
                       </div>
 
@@ -1483,6 +1606,15 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                           <RotateCw className={`w-3.5 h-3.5 ${cyclingKey === `${detailModalRow.row_index}-product` ? 'animate-spin' : ''}`} />
                           <span>Cycle Product Image ({detailModalRow.product_alternatives?.length || 0})</span>
                         </button>
+                        <button
+                          onClick={() => handleRetrySingle(detailModalRow.row_index, null, 'product')}
+                          disabled={!!retryingTarget}
+                          className="bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-wait text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 shadow-md active:scale-95"
+                          title="Search this image again (fresh search, skips the current image)"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${retryingTarget === 'product' || retryingTarget === 'both' ? 'animate-spin' : ''}`} />
+                          <span>{retryingTarget === 'product' ? 'Searching...' : 'Retry'}</span>
+                        </button>
                       </div>
 
                       {/* Alternatives mini grid */}
@@ -1519,7 +1651,9 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                           </h4>
                         </div>
                         <span className="text-[10px] bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 px-2.5 py-0.5 rounded-full font-mono font-bold">
-                          Exact Size Pack
+                          {detailModalRow.variant_image_url
+                            ? `${detailModalRow.variant_confidence || 'MEDIUM'}${SOURCE_LABEL[detailModalRow.variant_source] || ''}`
+                            : 'Not found'}
                         </span>
                       </div>
 
@@ -1602,6 +1736,15 @@ MAGGI-MASALA-280G-004,280g,Maggi 2-Minute Masala Instant Noodles,Maggi Noodles 2
                         >
                           <RotateCw className={`w-3.5 h-3.5 ${cyclingKey === `${detailModalRow.row_index}-variant` ? 'animate-spin' : ''}`} />
                           <span>Cycle Variant Image ({detailModalRow.variant_alternatives?.length || 0})</span>
+                        </button>
+                        <button
+                          onClick={() => handleRetrySingle(detailModalRow.row_index, null, 'variant')}
+                          disabled={!!retryingTarget}
+                          className="bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-wait text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 shadow-md active:scale-95"
+                          title="Search this image again (fresh search, skips the current image)"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${retryingTarget === 'variant' || retryingTarget === 'both' ? 'animate-spin' : ''}`} />
+                          <span>{retryingTarget === 'variant' ? 'Searching...' : 'Retry'}</span>
                         </button>
                       </div>
 

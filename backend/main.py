@@ -9,7 +9,7 @@ import pandas as pd
 from typing import Optional, List
 
 from models import SearchConfig, JobStatus, RowResult, ImageResult
-from processor import job_manager
+from processor import job_manager, parse_table
 from searxng_client import test_searxng_connection, search_searxng_image
 import httpx
 
@@ -30,12 +30,23 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def warm_ocr_engines():
-    # Load all OCR engines in the background so the first rows of a job are not slow
+    # Load all OCR engines and the vision model in the background so the first rows of a job are not slow
+    for module in ("ocr_engine", "vision_engine"):
+        try:
+            __import__(module).warmup()
+        except Exception:
+            pass
+    # Jobs interrupted by a restart / crash continue where they stopped
     try:
-        import ocr_engine
-        ocr_engine.warmup()
+        await job_manager.restore_jobs()
     except Exception:
         pass
+
+@app.get("/api/jobs")
+async def list_jobs():
+    """Recent jobs (also those from before a restart), newest first."""
+    import job_store
+    return job_store.list_jobs()
 
 @app.get("/api/health")
 async def health_check():
@@ -75,27 +86,19 @@ async def upload_file(file: UploadFile = File(...)):
     ext = filename.lower().split(".")[-1]
 
     content = await file.read()
+    if ext not in ["xlsx", "xls", "csv"]:
+        raise HTTPException(status_code=400, detail="Only .csv, .xlsx, and .xls files are supported.")
     try:
-        if ext in ["xlsx", "xls"]:
-            df = pd.read_excel(content, dtype=str)
-        elif ext == "csv":
-            try:
-                # Try UTF-8 first with dtype=str to prevent '9AM' from becoming '9:00 AM'
-                df = pd.read_csv(pd.io.common.BytesIO(content), encoding="utf-8", dtype=str)
-            except UnicodeDecodeError:
-                # Fallback to latin1 / cp1252
-                df = pd.read_csv(pd.io.common.BytesIO(content), encoding="latin1", dtype=str)
-        else:
-            raise HTTPException(status_code=400, detail="Only .csv, .xlsx, and .xls files are supported.")
+        # Text columns (prevents '9AM' from becoming '9:00 AM'), UTF-8 with latin1 fallback for CSV
+        clean_df = parse_table(content, filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
 
-    if df.empty:
+    if clean_df.empty:
         raise HTTPException(status_code=400, detail="The uploaded file contains no data.")
 
-    # Fill NaN values with empty string for clean JSON serialization
-    clean_df = df.fillna("")
-    job = job_manager.create_job_from_dataframe(clean_df, filename)
+    # The original file is stored with the job so it can resume after a restart
+    job = job_manager.create_job_from_dataframe(clean_df, filename, content=content)
 
     # Preview first 10 rows
     preview = clean_df.head(10).to_dict(orient="records")
@@ -275,6 +278,14 @@ async def download_results(job_id: str, format: str = Query("csv")):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    """index.html is never cached, so an open tab picks up a new build on refresh (assets are hashed)."""
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 # Mount frontend production build if available
 frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))

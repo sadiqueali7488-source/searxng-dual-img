@@ -7,7 +7,45 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 import httpx
 from models import SearchConfig, JobStatus, RowResult, ImageResult
-from searxng_client import search_searxng_image, sanitize_search_query, is_query_multipack
+from searxng_client import search_searxng_image, sanitize_search_query, is_query_multipack, SAME_PACK_SIMILARITY
+import job_store
+try:
+    import vision_engine
+except Exception:
+    vision_engine = None
+
+
+def parse_table(content: bytes, filename: str) -> pd.DataFrame:
+    """Reads an uploaded .xlsx / .xls / .csv as text columns (so '9AM' never becomes '9:00 AM')."""
+    ext = (filename or "").lower().split(".")[-1]
+    if ext in ["xlsx", "xls"]:
+        df = pd.read_excel(io.BytesIO(content), dtype=str)
+    elif ext == "csv":
+        try:
+            df = pd.read_csv(io.BytesIO(content), encoding="utf-8", dtype=str)
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(content), encoding="latin1", dtype=str)
+    else:
+        raise ValueError("Only .csv, .xlsx, and .xls files are supported.")
+    df = df.fillna("")
+    # Text saved twice with the wrong encoding ("EldÃ¶re" -> "Eldöre"): repaired so search + OCR match
+    for col in df.columns:
+        mask = df[col].str.contains(_MOJIBAKE_MARK, regex=True, na=False)
+        if mask.any():
+            df.loc[mask, col] = df.loc[mask, col].map(fix_mojibake)
+    return df
+
+_MOJIBAKE_MARK = r"Ã.|Â.|â[-¿‘-›€]"
+
+def fix_mojibake(text: str) -> str:
+    """'EldÃ¶re' -> 'Eldöre'; text that isn't double-encoded is returned unchanged."""
+    for enc in ("cp1252", "latin1"):
+        try:
+            fixed = text.encode(enc).decode("utf-8")
+            return fixed if fixed != text else text
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
 
 PRODUCT_MASTER_30_COLUMNS = [
     'sku', 'variant_label', 'product_name', 'product_description',
@@ -134,6 +172,109 @@ def clean_image_link(img_val: Any) -> str:
     return s.strip()
 
 
+def _set_image(row: RowResult, target: str, img: ImageResult, alternatives: Optional[List[ImageResult]] = None):
+    url = clean_image_link(img.img_src)
+    thumb = clean_image_link(img.thumbnail_src) or url
+    if target == "variant":
+        row.variant_image_url, row.variant_thumbnail_url = url, thumb
+        row.variant_resolution, row.variant_engine = img.resolution, img.engine
+        if alternatives is not None:
+            row.variant_alternatives = alternatives
+    else:
+        row.product_image_url, row.product_thumbnail_url = url, thumb
+        row.product_resolution, row.product_engine = img.resolution, img.engine
+        if alternatives is not None:
+            row.product_alternatives = alternatives
+
+
+def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v: Optional[Dict[str, Any]]):
+    """
+    Writes both searches into the row, then reconciles them:
+      1. product and variant image must show the same pack (vision embedding similarity);
+         on a mismatch a matching verified variant alternative is used, else the variant is flagged LOW
+      2. variant not found -> the product image is used for the variant (variant_source=PRODUCT_IMAGE)
+      3. product not found -> the variant image is used for the product (product_source=VARIANT_IMAGE)
+    Last-tier picks are flagged: variant_source=NEAREST_SIZE (closest size the company makes),
+    *_source=SIMILAR (vision-confirmed, OCR could not read the name). A SIMILAR pick never replaces a
+    verified image of the other search: the verified one is borrowed instead.
+    """
+    tier_p = (res_p or {}).get("match") if (res_p or {}).get("status") == "SUCCESS" else None
+    tier_v = (res_v or {}).get("match") if (res_v or {}).get("status") == "SUCCESS" else None
+    # a SIMILAR variant is never better than the product's own image (same pack on both sides)
+    if tier_v == "relaxed" and tier_p:
+        res_v = {**res_v, "status": "NOT_FOUND", "best_image": None}     # -> variant borrows the verified product image
+        tier_v = None
+    if tier_p == "relaxed" and tier_v and tier_v != "relaxed":
+        res_p = {**res_p, "status": "NOT_FOUND", "best_image": None}     # -> product borrows the verified variant image
+        tier_p = None
+    if res_p is not None:
+        row.product_status = res_p["status"]
+        row.product_source = ""
+        if res_p["status"] == "SUCCESS" and res_p.get("best_image"):
+            _set_image(row, "product", res_p["best_image"], res_p.get("alternatives", []))
+            row.product_confidence = res_p.get("confidence") or "MEDIUM"
+            row.product_source = "SIMILAR" if tier_p == "relaxed" else ""
+        else:
+            row.product_image_url = row.product_thumbnail_url = ""
+            row.product_confidence = ""
+    if res_v is not None:
+        row.variant_status = res_v["status"]
+        row.variant_source = ""
+        if res_v["status"] == "SUCCESS" and res_v.get("best_image"):
+            _set_image(row, "variant", res_v["best_image"], res_v.get("alternatives", []))
+            row.variant_confidence = res_v.get("confidence") or "MEDIUM"
+            row.variant_source = {"nearest": "NEAREST_SIZE", "relaxed": "SIMILAR"}.get(tier_v, "")
+        else:
+            row.variant_image_url = row.variant_thumbnail_url = ""
+            row.variant_confidence = ""
+
+    # 1. Same pack check (only when both searches ran now and both have vision embeddings)
+    if res_p and res_v and row.product_image_url and row.variant_image_url and vision_engine is not None:
+        p_emb, v_emb = res_p.get("embedding"), res_v.get("embedding")
+        sim = vision_engine.similarity(p_emb, v_emb)
+        if sim is not None and sim < SAME_PACK_SIMILARITY:
+            alt_embs = res_v.get("alt_embeddings") or {}
+            best_alt, best_sim = None, sim
+            for alt in res_v.get("alternatives", []):
+                s = vision_engine.similarity(p_emb, alt_embs.get(alt.img_src))
+                if s is not None and s >= SAME_PACK_SIMILARITY and s > best_sim:
+                    best_alt, best_sim = alt, s
+            if best_alt is not None:
+                others = [a for a in row.variant_alternatives if a.img_src != best_alt.img_src]
+                _set_image(row, "variant", best_alt, others)
+                row.variant_confidence = "MEDIUM"
+                row.variant_source = ""
+            elif row.product_confidence == "HIGH" and row.variant_confidence != "HIGH":
+                # The variant shows a different pack (e.g. Bansi Rava for Besan) and the product image is
+                # verified: a wrong product must never stay, so the verified product image is used instead
+                others = row.variant_alternatives
+                _set_image(row, "variant", ImageResult(img_src=row.product_image_url, thumbnail_src=row.product_thumbnail_url,
+                                                       resolution=row.product_resolution, engine=row.product_engine), others)
+                row.variant_source, row.variant_confidence = "PRODUCT_IMAGE", "LOW"
+            else:
+                row.variant_confidence = "LOW"
+
+    # 2./3. Borrow the other image when one search found nothing (same product; flagged in the export)
+    if row.product_image_url and not row.variant_image_url:
+        _set_image(row, "variant", ImageResult(img_src=row.product_image_url, thumbnail_src=row.product_thumbnail_url,
+                                               resolution=row.product_resolution, engine=row.product_engine))
+        row.variant_status, row.variant_source, row.variant_confidence = "SUCCESS", "PRODUCT_IMAGE", "LOW"
+    elif row.variant_image_url and not row.product_image_url:
+        _set_image(row, "product", ImageResult(img_src=row.variant_image_url, thumbnail_src=row.variant_thumbnail_url,
+                                               resolution=row.variant_resolution, engine=row.variant_engine))
+        row.product_status, row.product_source, row.product_confidence = "SUCCESS", "VARIANT_IMAGE", "MEDIUM"
+
+    if row.product_image_url and row.variant_image_url:
+        row.status = "SUCCESS"
+    elif "ERROR" in ((res_p or {}).get("status"), (res_v or {}).get("status")):
+        row.status = "ERROR"
+        row.error_message = (res_p or {}).get("error_message") or (res_v or {}).get("error_message")
+    else:
+        row.status = "NOT_FOUND"
+    row.image_url = row.product_image_url or row.variant_image_url
+    row.thumbnail_url = row.product_thumbnail_url or row.variant_thumbnail_url
+
+
 class SearchJob:
     def __init__(self, job_id: str, df: pd.DataFrame, filename: str):
         self.job_id = job_id
@@ -208,20 +349,36 @@ class SearchJob:
             except Exception:
                 pass
 
+    def persist_row(self, row: RowResult):
+        """Every finished row goes to disk at once, so a crash or restart loses nothing."""
+        try:
+            job_store.save_row(self.job_id, row.row_index, row.model_dump_json())
+        except Exception:
+            pass
+
+    def persist_status(self):
+        try:
+            job_store.save_status(self.job_id, self.status.model_dump())
+        except Exception:
+            pass
+
     def pause(self):
         self.is_paused = True
         self.pause_event.clear()
         self.status.state = "paused"
+        self.persist_status()
 
     def resume(self):
         self.is_paused = False
         self.pause_event.set()
         self.status.state = "running"
+        self.persist_status()
 
     def cancel(self):
         self.is_cancelled = True
         self.pause_event.set()
         self.status.state = "cancelled"
+        self.persist_status()
         if self.task and not self.task.done():
             self.task.cancel()
 
@@ -287,6 +444,17 @@ class SearchJob:
                 return row
         return None
 
+    def _recount_status(self, before: str, after: str):
+        """Keeps the job's found / not found / error counters right after a single row changes."""
+        names = {"SUCCESS": "success_count", "NOT_FOUND": "not_found_count", "ERROR": "error_count"}
+        if before == after:
+            return
+        if before in names:
+            setattr(self.status, names[before], max(0, getattr(self.status, names[before]) - 1))
+        if after in names:
+            setattr(self.status, names[after], getattr(self.status, names[after]) + 1)
+        self.persist_status()
+
     async def retry_row_search(
         self,
         row_index: int,
@@ -303,10 +471,13 @@ class SearchJob:
 
             orig = row.original_data or {}
             brand_val, prod_val, var_val = self.row_values(orig)
+            res_p = res_v = None
+            before_status = row.status
 
             # 1. Search Product Image (Without Size)
             if target in ["both", "product"]:
                 p_query = custom_query if (target == "product" and custom_query) else row.product_query
+                old_p = (row.product_image_url, row.product_thumbnail_url)
                 row.product_status = "SEARCHING"
                 await self.broadcast("row_update", row.model_dump())
 
@@ -320,20 +491,16 @@ class SearchJob:
                     is_variant=False,
                     safesearch=safesearch,
                     time_range=time_range,
-                    language=language
+                    language=language,
+                    deep=True,
+                    fresh=True,
+                    exclude=list(old_p)
                 )
-                row.product_status = res_p["status"]
-                if res_p["status"] == "SUCCESS" and res_p["best_image"]:
-                    best = res_p["best_image"]
-                    row.product_image_url = clean_image_link(best.img_src)
-                    row.product_thumbnail_url = clean_image_link(best.thumbnail_src) or row.product_image_url
-                    row.product_resolution = best.resolution
-                    row.product_engine = best.engine
-                    row.product_alternatives = res_p.get("alternatives", [])
 
             # 2. Search Variant Image (With Size)
             if target in ["both", "variant"]:
                 v_query = custom_query if (target == "variant" and custom_query) else row.variant_query
+                old_v = (row.variant_image_url, row.variant_thumbnail_url)
                 row.variant_status = "SEARCHING"
                 await self.broadcast("row_update", row.model_dump())
 
@@ -347,29 +514,47 @@ class SearchJob:
                     is_variant=True,
                     safesearch=safesearch,
                     time_range=time_range,
-                    language=language
+                    language=language,
+                    deep=True,
+                    fresh=True,
+                    exclude=list(old_v)
                 )
-                row.variant_status = res_v["status"]
-                if res_v["status"] == "SUCCESS" and res_v["best_image"]:
-                    best_v = res_v["best_image"]
-                    row.variant_image_url = clean_image_link(best_v.img_src)
-                    row.variant_thumbnail_url = clean_image_link(best_v.thumbnail_src) or row.variant_image_url
-                    row.variant_resolution = best_v.resolution
-                    row.variant_engine = best_v.engine
-                    row.variant_alternatives = res_v.get("alternatives", [])
 
-            # Overall status
+            # Retry looks for a different image than the current one
+            row.retry_note = ""
+            kept = []
+            prev = {}
+            if res_p is not None and res_p["status"] != "SUCCESS" and old_p[0]:
+                prev["product"] = (old_p, row.product_confidence, row.product_source)
+                kept.append("product")
+            if res_v is not None and res_v["status"] != "SUCCESS" and old_v[0]:
+                prev["variant"] = (old_v, row.variant_confidence, row.variant_source)
+                kept.append("variant")
+            apply_search_results(row, res_p, res_v)
+            # The other image is borrowed when one is still missing (variant <- product image); the old image
+            # comes back only when nothing at all was found, so the row is never wiped by a retry
+            notes = []
+            for side in kept:
+                other = "variant" if side == "product" else "product"
+                if getattr(row, f"{side}_image_url"):
+                    notes.append(f"No other verified {side} image found; using the {other} image")
+                    continue
+                (url, thumb), conf, src = prev[side]
+                setattr(row, f"{side}_image_url", url)
+                setattr(row, f"{side}_thumbnail_url", thumb)
+                setattr(row, f"{side}_confidence", conf)
+                setattr(row, f"{side}_source", src)
+                setattr(row, f"{side}_status", "SUCCESS")
+                notes.append(f"No other verified {side} image found; kept the current one")
+            row.retry_note = "; ".join(notes)
             if row.product_image_url and row.variant_image_url:
-                row.status = "SUCCESS"
-            elif row.product_image_url or row.variant_image_url:
-                row.status = "PARTIAL"
-            else:
-                row.status = "NOT_FOUND"
-
+                row.status, row.error_message = "SUCCESS", None
             row.image_url = row.product_image_url or row.variant_image_url
             row.thumbnail_url = row.product_thumbnail_url or row.variant_thumbnail_url
-
+            self._recount_status(before_status, row.status)
             await self.broadcast("row_update", row.model_dump())
+            await self.broadcast("status_update", self.status.model_dump())
+            self.persist_row(row)
             return row
         return None
 
@@ -378,19 +563,37 @@ class JobManager:
     def __init__(self):
         self.jobs: Dict[str, SearchJob] = {}
 
-    def create_job_from_dataframe(self, df: pd.DataFrame, filename: str) -> SearchJob:
-        job_id = str(uuid.uuid4())
+    def create_job_from_dataframe(self, df: pd.DataFrame, filename: str, content: Optional[bytes] = None,
+                                  job_id: Optional[str] = None) -> SearchJob:
+        job_id = job_id or str(uuid.uuid4())
         job = SearchJob(job_id=job_id, df=df, filename=filename)
         self.jobs[job_id] = job
+        if content is not None:
+            job_store.save_upload(job_id, filename, content)
         return job
 
     def get_job(self, job_id: str) -> Optional[SearchJob]:
         return self.jobs.get(job_id)
 
-    async def start_job(self, job_id: str, config: SearchConfig):
+    async def restore_jobs(self):
+        """On server start: reload stored jobs; jobs that were running continue where they stopped."""
+        for stored in job_store.load_jobs():
+            try:
+                df = parse_table(stored["file"], stored["filename"])
+                job = self.create_job_from_dataframe(df, stored["filename"], job_id=stored["job_id"])
+                config = SearchConfig(**stored["config"])
+                was_running = (stored.get("status") or {}).get("state") in ("running", "paused", None)
+                await self.start_job(job.job_id, config, resume_rows=stored["rows"], run=was_running)
+            except Exception:
+                continue
+
+    async def start_job(self, job_id: str, config: SearchConfig, resume_rows: Optional[List[Dict[str, Any]]] = None,
+                        run: bool = True):
         job = self.get_job(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
+        if resume_rows is None:
+            job_store.save_config(job_id, config.model_dump())
 
         job.config = config
         # The column the user picked as the product name is also the one the checks verify against
@@ -483,6 +686,24 @@ class JobManager:
                 status="PENDING"
             ))
 
+        if resume_rows:
+            # Resume: rows finished before the restart keep their results and are not searched again
+            by_index = {r.get("row_index"): r for r in resume_rows}
+            for i, row in enumerate(job.row_results):
+                stored = by_index.get(row.row_index)
+                if stored and stored.get("status") not in ("PENDING", "SEARCHING", None):
+                    job.row_results[i] = RowResult(**stored)
+            done = [r for r in job.row_results if r.status not in ("PENDING", "SEARCHING")]
+            job.status.processed_rows = len(done)
+            job.status.success_count = sum(1 for r in done if r.status == "SUCCESS")
+            job.status.error_count = sum(1 for r in done if r.status == "ERROR")
+            job.status.not_found_count = len(done) - job.status.success_count - job.status.error_count
+            job.status.progress_percent = round(100 * len(done) / max(1, job.status.total_rows), 1)
+
+        if not run:
+            job.status.state = "completed"
+            return job
+        job.persist_status()
         job.task = asyncio.create_task(self._execute_job(job))
         return job
 
@@ -499,13 +720,14 @@ class JobManager:
             if now - last_status_push >= 0.5:
                 last_status_push = now
                 await job.broadcast("status_update", job.status.model_dump())
+                job.persist_status()
 
         # Each row runs two searches at once, each downloading up to 4 images in parallel
         limits = httpx.Limits(max_keepalive_connections=config.concurrency * 4, max_connections=config.concurrency * 10)
         async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
             target_rows = specific_rows if specific_rows is not None else job.row_results
 
-            async def process_single_row(row_res: RowResult):
+            async def process_single_row(row_res: RowResult, deep: bool = False):
                 if job.is_cancelled:
                     return
                 await job.pause_event.wait()
@@ -526,65 +748,29 @@ class JobManager:
 
                 # 1. Product Image (Without Size) and 2. Variant Image (With Size):
                 # separate independent searches and inspections, run side by side
-                res_p, res_v = await asyncio.gather(
+                res_p, res_v = await asyncio.gather(*(
                     search_searxng_image(
                         client=client,
                         base_url=config.searxng_url,
-                        query=row_res.product_query,
+                        query=row_res.variant_query if is_var else row_res.product_query,
                         brand=b_val,
                         product_name=p_val,
                         variant_label=v_val,
-                        is_variant=False,
+                        is_variant=is_var,
                         safesearch=config.safesearch,
                         time_range=config.time_range,
-                        language=config.language
-                    ),
-                    search_searxng_image(
-                        client=client,
-                        base_url=config.searxng_url,
-                        query=row_res.variant_query,
-                        brand=b_val,
-                        product_name=p_val,
-                        variant_label=v_val,
-                        is_variant=True,
-                        safesearch=config.safesearch,
-                        time_range=config.time_range,
-                        language=config.language
-                    )
-                )
+                        language=config.language,
+                        deep=deep
+                    ) for is_var in (False, True)
+                ))
+                apply_search_results(row_res, res_p, res_v)
 
-                row_res.product_status = res_p["status"]
-                if res_p["status"] == "SUCCESS" and res_p["best_image"]:
-                    best_p = res_p["best_image"]
-                    row_res.product_image_url = clean_image_link(best_p.img_src)
-                    row_res.product_thumbnail_url = clean_image_link(best_p.thumbnail_src) or row_res.product_image_url
-                    row_res.product_resolution = best_p.resolution
-                    row_res.product_engine = best_p.engine
-                    row_res.product_alternatives = res_p.get("alternatives", [])
-
-                row_res.variant_status = res_v["status"]
-                if res_v["status"] == "SUCCESS" and res_v["best_image"]:
-                    best_v = res_v["best_image"]
-                    row_res.variant_image_url = clean_image_link(best_v.img_src)
-                    row_res.variant_thumbnail_url = clean_image_link(best_v.thumbnail_src) or row_res.variant_image_url
-                    row_res.variant_resolution = best_v.resolution
-                    row_res.variant_engine = best_v.engine
-                    row_res.variant_alternatives = res_v.get("alternatives", [])
-
-                # Determine overall status
-                if row_res.product_image_url and row_res.variant_image_url:
-                    row_res.status = "SUCCESS"
+                if row_res.status == "SUCCESS":
                     job.status.success_count += 1
-                elif "ERROR" in (res_p["status"], res_v["status"]):
-                    row_res.status = "ERROR"
-                    row_res.error_message = res_p.get("error_message") or res_v.get("error_message")
+                elif row_res.status == "ERROR":
                     job.status.error_count += 1
                 else:
-                    row_res.status = "NOT_FOUND"
                     job.status.not_found_count += 1
-
-                row_res.image_url = row_res.product_image_url or row_res.variant_image_url
-                row_res.thumbnail_url = row_res.product_thumbnail_url or row_res.variant_thumbnail_url
 
                 job.status.processed_rows += 1
                 elapsed = max(0.1, time.time() - job.start_time)
@@ -596,32 +782,53 @@ class JobManager:
                 job.status.progress_percent = round((job.status.processed_rows / job.status.total_rows) * 100, 1)
 
                 await job.broadcast("row_update", row_res.model_dump())
+                job.persist_row(row_res)
                 await push_status()
 
-            # Fixed pool of workers pulling rows from a queue (not one task per row for 1 lakh rows)
-            queue: asyncio.Queue = asyncio.Queue()
-            for row in target_rows:
-                queue.put_nowait(row)
+            async def run_pass(rows: List[RowResult], deep: bool):
+                # Fixed pool of workers pulling rows from a queue (not one task per row for 1 lakh rows)
+                queue: asyncio.Queue = asyncio.Queue()
+                for row in rows:
+                    queue.put_nowait(row)
 
-            async def worker():
-                while not job.is_cancelled:
-                    try:
-                        row_res = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
-                    try:
-                        await process_single_row(row_res)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        row_res.status = "ERROR"
-                        row_res.error_message = str(e)
-                        job.status.error_count += 1
-                        job.status.processed_rows += 1
-                        await job.broadcast("row_update", row_res.model_dump())
+                async def worker():
+                    while not job.is_cancelled:
+                        try:
+                            row_res = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        try:
+                            await process_single_row(row_res, deep)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            row_res.status = "ERROR"
+                            row_res.error_message = str(e)
+                            job.status.error_count += 1
+                            job.status.processed_rows += 1
+                            await job.broadcast("row_update", row_res.model_dump())
+                            job.persist_row(row_res)
+
+                await asyncio.gather(*(worker() for _ in range(config.concurrency)))
 
             try:
-                await asyncio.gather(*(worker() for _ in range(config.concurrency)))
+                # Rows already finished (a resumed job) are not searched again
+                pending = [r for r in target_rows if r.status in ("PENDING", "SEARCHING") or specific_rows is not None]
+                await run_pass(pending, deep=specific_rows is not None)
+
+                # Automatic deep retry of every row still without both images (no button needed)
+                if not job.is_cancelled and specific_rows is None:
+                    failed = [r for r in target_rows if r.status in ("NOT_FOUND", "ERROR")]
+                    if failed:
+                        for r in failed:
+                            if r.status == "ERROR":
+                                job.status.error_count = max(0, job.status.error_count - 1)
+                            else:
+                                job.status.not_found_count = max(0, job.status.not_found_count - 1)
+                            job.status.processed_rows = max(0, job.status.processed_rows - 1)
+                        job.status.current_query = f"Auto-retry: {len(failed)} rows with deeper search"
+                        await push_status()
+                        await run_pass(failed, deep=True)
             except asyncio.CancelledError:
                 job.status.state = "cancelled"
             except Exception as e:
@@ -631,6 +838,7 @@ class JobManager:
             job.status.state = "completed"
             job.status.progress_percent = 100.0
 
+        job.persist_status()
         await job.broadcast("status_update", job.status.model_dump())
         await job.broadcast("job_done", {"job_id": job.job_id, "state": job.status.state})
 
@@ -697,6 +905,7 @@ class JobManager:
             # DIRECT CLEAN LINKS WITHOUT ARRAY BRACKETS
             row_dict["product_images"] = prod_link
             row_dict["variant_images"] = var_link
+            # Confidence / source stay in the app (badges), not in the downloaded file
 
             if not job.is_product_master:
                 row_dict["product_image_url"] = prod_link

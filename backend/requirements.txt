@@ -1,0 +1,22 @@
+# API
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.33
+pydantic==2.14.2
+httpx==0.28.1
+
+# Excel / CSV
+pandas==3.1.0
+openpyxl==3.1.5
+
+# Images + OCR (PP-OCRv6 small/medium on ONNX Runtime; RapidOCR as fallback)
+numpy==2.3.5
+pillow==13.0.0
+onnxruntime==1.31.1
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+paddlex==3.7.2
+rapidocr-onnxruntime==1.4.4
+
+# Vision (OpenCLIP). torch CPU wheels come from the PyTorch index (see Dockerfile)
+open_clip_torch==3.3.0
