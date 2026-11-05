@@ -201,10 +201,10 @@ def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v:
     tier_p = (res_p or {}).get("match") if (res_p or {}).get("status") == "SUCCESS" else None
     tier_v = (res_v or {}).get("match") if (res_v or {}).get("status") == "SUCCESS" else None
     # a SIMILAR variant is never better than the product's own image (same pack on both sides)
-    if tier_v == "relaxed" and tier_p:
+    if tier_v in ("relaxed", "loose") and tier_p and tier_p != "loose":
         res_v = {**res_v, "status": "NOT_FOUND", "best_image": None}     # -> variant borrows the verified product image
         tier_v = None
-    if tier_p == "relaxed" and tier_v and tier_v != "relaxed":
+    if tier_p in ("relaxed", "loose") and tier_v and tier_v not in ("relaxed", "loose"):
         res_p = {**res_p, "status": "NOT_FOUND", "best_image": None}     # -> product borrows the verified variant image
         tier_p = None
     if res_p is not None:
@@ -213,7 +213,7 @@ def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v:
         if res_p["status"] == "SUCCESS" and res_p.get("best_image"):
             _set_image(row, "product", res_p["best_image"], res_p.get("alternatives", []))
             row.product_confidence = res_p.get("confidence") or "MEDIUM"
-            row.product_source = "SIMILAR" if tier_p == "relaxed" else ""
+            row.product_source = "SIMILAR" if tier_p in ("relaxed", "loose") else ""
         else:
             row.product_image_url = row.product_thumbnail_url = ""
             row.product_confidence = ""
@@ -223,7 +223,7 @@ def apply_search_results(row: RowResult, res_p: Optional[Dict[str, Any]], res_v:
         if res_v["status"] == "SUCCESS" and res_v.get("best_image"):
             _set_image(row, "variant", res_v["best_image"], res_v.get("alternatives", []))
             row.variant_confidence = res_v.get("confidence") or "MEDIUM"
-            row.variant_source = {"nearest": "NEAREST_SIZE", "relaxed": "SIMILAR"}.get(tier_v, "")
+            row.variant_source = {"nearest": "NEAREST_SIZE", "relaxed": "SIMILAR", "loose": "SIMILAR"}.get(tier_v, "")
         else:
             row.variant_image_url = row.variant_thumbnail_url = ""
             row.variant_confidence = ""
